@@ -1,0 +1,314 @@
+# 🔬 Talking BI — Complete Gap Analysis & Feature Roadmap
+
+> Forensic comparison: **Current codebase** vs **v4.0 prompt spec**
+
+---
+
+## ✅ What's Already Built (Current State)
+
+| Feature | Status | Notes |
+|---|---|---|
+| FastAPI backend with 14 routers | ✅ Done | All routes wired up |
+| CSV/Excel upload + basic cleaning | ✅ Done | [upload.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/routers/upload.py) + [cleaning_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/cleaning_agent.py) |
+| Schema detection | ✅ Done | [utils/schema_detector.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/utils/schema_detector.py) |
+| Orchestrator (7-agent pipeline) | ✅ Done | [orchestrator.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/orchestrator.py) |
+| Analyst agent (KPIs, correlations, trends) | ✅ Done | [analyst_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/analyst_agent.py) |
+| Critic agent (validation) | ✅ Done | [critic_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/critic_agent.py) |
+| Insight agent (rule-based only) | ✅ Partial | **LLM disabled** (`use_llm=False`) |
+| Strategist agent (recommendations) | ✅ Done | [strategist_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/strategist_agent.py) |
+| Chart agent (10 chart types) | ✅ Done | [chart_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/chart_agent.py) |
+| Root Cause agent (full causal chain) | ✅ Done | [root_cause_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/root_cause_agent.py) (687 lines) |
+| ML agent (train/predict) | ✅ Done | [ml_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/ml_agent.py) + [ml_service.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/services/ml_service.py) |
+| Report agent (PDF/PPTX) | ✅ Done | [report_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/report_agent.py) (40KB) |
+| Scrape agent (Playwright) | ✅ Done | [scrape_agent.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/scrape_agent.py) |
+| NL→Pandas query (25+ ops) | ✅ Done | [query_executor.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/services/query_executor.py) (458 lines) |
+| Intent classifier (JSON fallback) | ✅ Done | [intent_classifier.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/services/intent_classifier.py) |
+| Knowledge graph service | ✅ Done | [knowledge_graph_service.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/services/knowledge_graph_service.py) |
+| What-if simulation | ✅ Done | [what_if_service.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/services/what_if_service.py) |
+| FAISS semantic memory | ✅ Partial | Optional (graceful skip) |
+| ChromaDB | ✅ Partial | Optional (graceful skip) |
+| Export (PDF/PPTX server-side) | ✅ Done | [export_service.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/services/export_service.py) |
+| SQLite database (6 models) | ✅ Done | [database/models.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/database/models.py) |
+| React frontend (5 pages) | ✅ Done | Dashboard, Upload, Datasets, ML, Home |
+| Sentence Transformers (MiniLM) | ✅ Done | Model downloaded locally |
+| Zustand state + react-grid-layout | ✅ Done | Drag/resize dashboard tiles |
+| Drill-down, filters | ✅ Done | [drilldown.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/routers/drilldown.py), [filters.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/routers/filters.py) |
+| Groq API (llama-3.1-70b) + fallback | ✅ Done | Auto-falls back on rate limit |
+
+---
+
+## ❌ What's Missing (Gap Analysis)
+
+### 🔴 CRITICAL GAPS — These Block Production Use
+
+#### 1. **Authentication & Authorization** — COMPLETELY ABSENT
+- No JWT auth, no login/register, no user table
+- Anyone can access any dataset via any URL
+- No dataset ownership check
+
+#### 2. **Background Task Queue (Redis + Celery)** — MISSING
+- Pipeline runs synchronously — **60-second timeout risk** on large files
+- No progress tracking (SSE stream)
+- No task retry on failure
+- No pipeline status stored in DB
+
+#### 3. **Real RAG Pipeline** — MISSING
+- ChromaDB is initialized but **nothing is actually stored in it**
+- FAISS stores query history but is **not used for retrieval-augmented generation**
+- No document chunking, no retrieval pipeline feeding context to LLM
+- What exists: FAISS for query deduplication — **NOT a real RAG pipeline**
+
+#### 4. **LLM Insight Generation Disabled**
+- `use_llm=False` hardcoded in [orchestrator.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/orchestrator.py) line 157
+- Insight agent only uses rule-based patterns
+- LLM narration of insights = **zero** currently
+
+#### 5. **Startup Validation Missing**
+- No API key check on startup
+- No DB health check
+- No PIPELINE_LOCK semaphore (concurrent uploads can corrupt state)
+
+---
+
+### 🟡 IMPORTANT GAPS — Big Moat Features Missing
+
+#### 6. **FireDucks / DuckDB** — NOT INTEGRATED
+- Currently using Pandas for all data ops
+- **FireDucks** (pandas drop-in, 10–100x faster via JIT) = not installed
+- **DuckDB** (columnar SQL engine, handles 50M+ rows) = not installed
+- Large file performance would bottleneck at ~500K rows with current Pandas
+
+#### 7. **Indian Localization** — MISSING
+- No Rs/L/Cr number formatting
+- No Indian FY (April–March) grouping
+- No GST column auto-detection
+- No Hindi language mode
+- This is the **core market differentiator** from the prompt spec
+
+#### 8. **LangGraph State Machine** — NOT USED
+- Agents are called sequentially in plain Python ([orchestrator.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/orchestrator.py))
+- No LangGraph `StateGraph`, no typed `AgentState`, no conditional routing
+- Routing logic is `if plan.get("kpis"):` — not a proper state machine
+
+#### 9. **Forecast Agent** — MISSING
+- No time-series prediction endpoint
+- No LinearRegression + moving average fallback forecasting
+- Root cause agent exists but forecast = absent
+
+#### 10. **Conversation Agent (Multi-turn)** — MISSING
+- Query memory exists in SQLite but no sliding-window conversation context
+- Each NL query is stateless — no reference to prior turns
+- "What about last year?" after "Show revenue by region" = broken
+
+#### 11. **Doc2Chart Agent** — MISSING
+- Only CSV/Excel are processed
+- No PDF table extraction (pdfplumber = installed but unused for upload)
+- No DOCX table extraction
+- No image OCR (pytesseract not installed)
+
+#### 12. **Alert Engine** — MISSING
+- No threshold alerts ("alert if revenue < 50K")
+- No consecutive decline detection
+- No anomaly alert triggers
+- Anomaly detection exists in ML service but no alert system
+
+#### 13. **Dataset Diff** — MISSING
+- No endpoint to compare two datasets side-by-side
+- No schema diff, no KPI delta table, no overlaid charts
+
+#### 14. **Voice Query** — MISSING
+- No Whisper integration
+- No mic input on frontend
+- Not even planned in current routes
+
+#### 15. **InsightEval Agent** — MISSING
+- Insight agent generates insights but **no validator** checks numbers
+- LLM could hallucinate "Revenue grew 500%" when actual = 12%
+- Taxonomy check, number validation, novelty dedup = all absent
+
+#### 16. **Ollama / Privacy Mode** — MISSING
+- All LLM calls go to Groq (cloud)
+- No local fallback for sensitive data (CA firms, hospitals)
+- `LLM_PROVIDER` env switch = not implemented
+
+---
+
+### 🟢 NICE-TO-HAVE GAPS — Competitive Moat
+
+#### 17. **Story Mode** — MISSING
+- No 3-paragraph executive narrative endpoint
+- Report agent generates full reports but no lightweight story endpoint
+
+#### 18. **MongoDB** — NOT USED (Using SQLite)
+- Schema shows [Dataset](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/database/models.py#9-23), [Dashboard](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/database/models.py#25-38), etc. in SQLite
+- For multi-user + large scale: MongoDB/GridFS better
+- Current: SQLite works fine for MVP, needs migration for scale
+
+#### 19. **Docker Compose** — MISSING
+- No `docker-compose.yml`
+- No containerization for backend/frontend/redis/celery
+- Manual setup required
+
+#### 20. **EvalAgent (Pipeline QA)** — MISSING
+- No confidence score on dashboard header
+- No schema accuracy checker running post-pipeline
+- Critic agent exists but doesn't do full pipeline QA
+
+#### 21. **DeepPrep with Quality Score** — PARTIAL
+- Cleaning agent does 6 steps but no `quality_score` computed after each step
+- No step revert if score drops
+- No fuzzy category merge (fuzzywuzzy installed but not used in cleaning)
+
+#### 22. **Tests** — MINIMAL
+- [test_dashboard_api.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/test_dashboard_api.py), [test_data_flow.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/test_data_flow.py), [test_fixes.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/test_fixes.py) exist
+- No sample data generator with injected edge cases
+- No mock LLM test for InsightEval
+- No CI pipeline
+
+---
+
+## 🗺️ Prioritized Implementation Roadmap
+
+### 🔥 Phase 1 — Fix Critical Gaps (Week 1–2)
+
+| # | Feature | Effort | Impact |
+|---|---|---|---|
+| 1 | **Re-enable LLM insights** (`use_llm=True`) | 1hr | Immediate |
+| 2 | **Startup validation** (API key + DB ping + semaphore) | 2hr | Critical |
+| 3 | **Redis + Celery** background tasks + SSE progress | 1 day | Critical |
+| 4 | **Real RAG pipeline** (chunk dataset docs → ChromaDB → retrieve → inject into LLM context) | 2 days | High |
+| 5 | **JWT Auth** (login/register + dataset ownership) | 1 day | Critical |
+
+### 🚀 Phase 2 — Moat Features (Week 3–4)
+
+| # | Feature | Effort | Impact |
+|---|---|---|---|
+| 6 | **FireDucks** drop-in replacement for Pandas | 2hr | 10–100x perf |
+| 7 | **Indian localization** (Rs/L/Cr, Indian FY, Hindi) | 2 days | Market moat |
+| 8 | **Forecast Agent** (LinearRegression + MA) | 1 day | Feature moat |
+| 9 | **Conversation Agent** (6-turn sliding window) | 1 day | UX moat |
+| 10 | **InsightEval Agent** (number validation) | 1 day | Trust moat |
+| 11 | **Alert Engine** (threshold + decline + anomaly) | 2 days | Retention moat |
+
+### 💡 Phase 3 — Expansion (Month 2)
+
+| # | Feature | Effort | Impact |
+|---|---|---|---|
+| 12 | **LangGraph** state machine migration | 3 days | Architecture quality |
+| 13 | **Doc2Chart** (PDF, DOCX, image OCR) | 3 days | Market expansion |
+| 14 | **Dataset Diff** | 2 days | Enterprise moat |
+| 15 | **Ollama/Privacy Mode** | 1 day | CA/Hospital market |
+| 16 | **Story Mode** endpoint | 4hr | Executive UX |
+| 17 | **EvalAgent** (pipeline QA + confidence badge) | 1 day | Trust/QA |
+| 18 | **Voice Query** (Whisper) | 2 days | Accessibility moat |
+| 19 | **Docker Compose** | 4hr | Deployment |
+| 20 | **DeepPrep Quality Score** | 1 day | Data quality |
+
+---
+
+## 🛠️ Specific Implementation Details
+
+### RAG Pipeline (What Needs to Change)
+```python
+# Currently: ChromaDB initialized but EMPTY
+# Fix: After upload, chunk dataset description + insights → store in ChromaDB
+
+# backend/services/rag_service.py (NEW FILE NEEDED)
+async def index_dataset(dataset_id: str, df: pd.DataFrame, schema: dict, insights: list):
+    """Chunk and store dataset context in ChromaDB for RAG"""
+    chunks = [
+        f"Dataset columns: {list(schema.keys())}",
+        f"Row count: {len(df)}",
+        f"Sample data: {df.head(3).to_string()}",
+    ] + [insight['text'] for insight in insights]
+    
+    collection.add(documents=chunks, ids=[f"{dataset_id}_{i}" for i, _ in enumerate(chunks)])
+
+async def retrieve_context(query: str, dataset_id: str, n=3) -> str:
+    """Retrieve top-k relevant chunks for a query"""
+    results = collection.query(query_texts=[query], n_results=n,
+                               where={"dataset_id": dataset_id})
+    return "\n".join(results['documents'][0])
+```
+
+### FireDucks (2-Line Integration)
+```python
+# requirements.txt: add fireducks-pandas
+# backend/utils/df_engine.py (NEW FILE)
+try:
+    import fireducks.pandas as pd  # 10-100x faster, same API
+    USING_FIREDUCKS = True
+except ImportError:
+    import pandas as pd            # fallback to standard pandas
+    USING_FIREDUCKS = False
+```
+> Then replace `import pandas as pd` across all files with `from utils.df_engine import pd`
+
+### Redis + Celery (What to Add)
+```python
+# backend/tasks/pipeline_task.py (NEW FILE)
+from celery import Celery
+app = Celery('tasks', broker='redis://localhost:6379/0',
+             backend='redis://localhost:6379/0')
+
+@app.task(bind=True, max_retries=3)
+def run_pipeline_task(self, dataset_id: str):
+    stages = [
+        ('cleaning', 12), ('schema', 25), ('kpi', 45),
+        ('visualization', 65), ('insights', 80), ('eval', 95)
+    ]
+    for status, progress in stages:
+        update_status(dataset_id, status, progress)
+        # run agent ...
+    update_status(dataset_id, 'complete', 100)
+
+# Frontend: EventSource('/api/pipeline/status/{id}') → progress bar
+```
+
+### Conversation Agent (6-Turn Memory)
+```python
+# backend/agents/conversation_agent.py (NEW FILE)
+MAX_HISTORY = 6
+
+async def converse(query: str, dataset_id: str, schema: dict, history: list) -> dict:
+    context = retrieve_context(query, dataset_id)  # RAG
+    messages = [{"role":"system","content": f"Schema: {schema}\nContext: {context}"}]
+    messages += history[-MAX_HISTORY:]  # sliding window
+    messages.append({"role":"user","content": query})
+    response = await call_llm(messages)
+    return {"answer": response, "history": history + [
+        {"role":"user","content": query},
+        {"role":"assistant","content": response}
+    ]}
+```
+
+---
+
+## 📊 Feature Completion Score
+
+```
+Core Pipeline:          ████████░░  80%  (LLM insights disabled)
+NL Query:               █████████░  90%  (missing forecast op)
+Memory/RAG:             ████░░░░░░  40%  (ChromaDB empty, no RAG)
+Auth/Security:          ░░░░░░░░░░   0%
+Background Tasks:       ░░░░░░░░░░   0%
+Indian Localization:    ░░░░░░░░░░   0%
+Agent Quality (Eval):   ████░░░░░░  40%  (no InsightEval, no EvalAgent)
+Export:                 █████████░  90%
+Frontend/UX:            ████████░░  80%
+Performance (FireDucks): ░░░░░░░░░░  0%
+Doc Ingestion:          ░░░░░░░░░░   0%  (PDF/DOCX/image upload = absent)
+Deployment:             ░░░░░░░░░░   0%  (no Docker, no CI)
+
+OVERALL:                ████░░░░░░  ~45%  of v4.0 spec
+```
+
+---
+
+## 🎯 Quickest Wins (Do These First)
+
+1. **`use_llm=True`** in [orchestrator.py](file:///c:/Users/HP/OneDrive/Desktop/Talking%20BI/talking-bi/backend/agents/orchestrator.py) line 157 → immediate impact, zero effort
+2. **FireDucks** → 2-line change, 10–100x speed boost for large files
+3. **Startup validation** → prevents silent crashes in production
+4. **Re-enable FAISS** → make it non-optional, store top-5 insights as embeddings
+5. **Conversation sliding window** → 50-line file, massive UX improvement

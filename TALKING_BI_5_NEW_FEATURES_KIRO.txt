@@ -1,0 +1,2359 @@
+================================================================================
+KIRO PROMPT — TALKING BI: 5 NEW POWER FEATURES
+Add-Only. Zero Regression. Production-Ready.
+================================================================================
+
+PROJECT CONTEXT
+---------------
+Talking BI is an existing, 88%+ complete agentic BI platform with:
+  - FastAPI backend (Python 3.11+)
+  - React 18 + TypeScript frontend (Vite + TailwindCSS)
+  - 11 LangGraph agents already running
+  - Groq API (LLaMA 3.1 70B) as the LLM — free tier
+  - SQLite + SQLAlchemy for storage
+  - FAISS + ChromaDB for vector memory
+  - Recharts + Chart.js for visualization
+  - react-grid-layout for dashboard canvas
+  - Existing voice route at /api/voice/ with Whisper + pyttsx3
+  - Existing what-if at /api/ml/what-if (basic version)
+  - Existing upload at /api/upload/ supporting CSV/Excel/JSON
+
+PRIME DIRECTIVE
+---------------
+DO NOT modify any existing file unless explicitly told to in a section below.
+DO NOT break any existing endpoint, component, or agent.
+ONLY create new files and make the minimal surgical modifications listed.
+Every feature must be fully working. No stubs. No placeholders. No TODOs.
+All new backend code is async FastAPI. All new frontend code is TypeScript.
+All colors use CSS variables (var(--color-*)). No hardcoded hex.
+All new components handle loading states, error states, and empty states.
+
+================================================================================
+FEATURE 1 — VOICE-TO-INSIGHT (SPEECH RAG)
+================================================================================
+
+WHAT IT DOES
+------------
+User clicks a microphone button anywhere on the dashboard, speaks a query like
+"Show me the breakdown of marketing spend versus revenue for the last two
+quarters", and the system:
+  1. Transcribes speech via Whisper (already installed) OR browser Web Speech API
+  2. Sends transcript through the NL2Pandas query engine (already built)
+  3. Streams the result back: new chart tile appears on the dashboard canvas
+  4. Speaks the insight summary aloud via pyttsx3 TTS
+
+The key upgrade over the existing VoiceButton (which only works inside ChatPanel)
+is that this new GlobalVoiceTrigger works from ANYWHERE — dashboard canvas,
+insights page, upload page — and renders results directly as new chart tiles,
+not just chat bubbles.
+
+--------------------------------------------------------------------------------
+BACKEND — NEW FILE: backend/routers/voice_insight.py
+--------------------------------------------------------------------------------
+
+Create this new router. Register it in main.py at prefix="/api/voice-insight".
+
+"""
+Voice-to-Insight Route
+Transcribes audio → classifies intent → executes query → returns chart config.
+This is the "Speech RAG" pipeline: voice in, rendered chart out.
+"""
+
+import os
+import logging
+import tempfile
+import pandas as pd
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+
+from database.db import get_dataset_from_db       # EXISTING
+from services.intent_classifier import classify_intent   # EXISTING (from NL2Pandas)
+from services.query_executor import execute              # EXISTING (from NL2Pandas)
+from services.chart_generator import (                   # EXISTING
+    _build_bar_chart, _build_line_chart, _build_pie_chart,
+    _build_scatter, _build_histogram, _build_area_chart
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+_whisper_model = None
+
+def get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        model_name = os.getenv("WHISPER_MODEL", "base")
+        _whisper_model = whisper.load_model(model_name)
+    return _whisper_model
+
+
+@router.post("/transcribe-and-render")
+async def voice_to_insight(
+    audio: UploadFile = File(...),
+    dataset_id: str = ""
+):
+    """
+    Full Speech RAG pipeline:
+      1. Validate audio
+      2. Whisper transcription
+      3. Intent classification (NL2Pandas classifier)
+      4. Pandas query execution
+      5. Auto chart selection
+      6. Return: transcript + intent + chart_config + table_data + summary
+
+    Frontend renders the chart_config as a new tile on the dashboard canvas.
+    """
+    # --- 1. Validate ---
+    content = await audio.read()
+    if len(content) == 0:
+        raise HTTPException(400, "Empty audio file.")
+    if len(content) > 25 * 1024 * 1024:
+        raise HTTPException(400, "Audio too large. Max 25MB.")
+    if not dataset_id:
+        raise HTTPException(400, "dataset_id is required.")
+
+    # Check RMS — reject silent audio
+    try:
+        import numpy as np
+        audio_array = np.frombuffer(content, dtype=np.int16).astype(np.float32)
+        rms = np.sqrt(np.mean(audio_array ** 2))
+        if rms < 100:
+            return JSONResponse({"success": False, "error": "No speech detected. Please speak clearly."})
+    except Exception:
+        pass  # If RMS check fails, proceed anyway
+
+    # --- 2. Transcribe ---
+    suffix = os.path.splitext(audio.filename or "audio.wav")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        model = get_whisper()
+        result = model.transcribe(tmp_path, language="en")
+        transcript = result.get("text", "").strip()
+        language_prob = result.get("language_probability", 1.0)
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    if not transcript:
+        return JSONResponse({"success": False, "error": "Could not understand audio. Please try again."})
+
+    if language_prob < 0.6:
+        return JSONResponse({
+            "success": False,
+            "error": f"Low confidence transcription. Heard: '{transcript}'. Please speak more clearly."
+        })
+
+    # --- 3. Load dataset ---
+    doc = await get_dataset_from_db(dataset_id)
+    if not doc:
+        raise HTTPException(404, "Dataset not found.")
+    if not doc.get("schema"):
+        raise HTTPException(400, "Generate dashboard first before using voice queries.")
+
+    try:
+        df = pd.read_json(doc["df_json"], orient="split")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load dataset: {e}")
+
+    schema = doc["schema"]
+
+    # --- 4. Classify intent ---
+    intent = await classify_intent(transcript, schema)
+
+    # --- 5. Execute query ---
+    result_df, summary = execute(df, intent, schema)
+
+    # --- 6. Auto-select chart ---
+    chart_config = _select_chart_for_voice(result_df, intent.op, transcript)
+
+    # --- 7. Serialize result ---
+    MAX_ROWS = 500
+    total_rows = len(result_df)
+    display_df = result_df.head(MAX_ROWS)
+    records = _safe_serialize(display_df)
+
+    return {
+        "success": True,
+        "transcript": transcript,
+        "intent": intent.model_dump(),
+        "summary": summary,
+        "chart_config": chart_config,
+        "result": records,
+        "columns": list(display_df.columns),
+        "total_rows": total_rows,
+        "truncated": total_rows > MAX_ROWS,
+        # This tile_id is used by frontend to add a new tile to the dashboard
+        "suggested_tile": {
+            "title": transcript[:80],
+            "source": "voice",
+            "chart_config": chart_config
+        }
+    }
+
+
+@router.post("/speak-insight")
+async def speak_insight(text: str):
+    """
+    Convert insight text to audio for playback.
+    Reuses existing TTS engine.
+    """
+    import base64
+    if not text or not text.strip():
+        raise HTTPException(400, "No text to speak.")
+    if len(text) > 800:
+        text = text[:797] + "..."
+
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 165)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        engine.save_to_file(text, tmp_path)
+        engine.runAndWait()
+        with open(tmp_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        os.unlink(tmp_path)
+        return {"success": True, "audio_base64": audio_b64, "format": "wav"}
+    except Exception as e:
+        raise HTTPException(500, f"TTS failed: {e}")
+
+
+def _select_chart_for_voice(df: pd.DataFrame, op: str, query: str) -> dict | None:
+    """Smart chart selection for voice query results."""
+    if df is None or df.empty or len(df.columns) < 2:
+        return None
+    try:
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        str_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        date_cols = [c for c in df.columns if any(kw in c.lower() for kw in ["date", "month", "year", "week", "period"])]
+
+        if date_cols and num_cols:
+            return _build_line_chart(df, date_cols[0], num_cols[0], query)
+        if op in ("groupby", "topn", "having", "resample") and str_cols and num_cols:
+            return _build_bar_chart(df, str_cols[0], num_cols[0], query, top_n=15)
+        if op == "pct_change" and date_cols and num_cols:
+            return _build_area_chart(df, date_cols[0], num_cols[0], query)
+        if str_cols and num_cols:
+            return _build_bar_chart(df, str_cols[0], num_cols[0], query, top_n=15)
+        if len(num_cols) >= 2:
+            return _build_scatter(df, num_cols[0], num_cols[1], query)
+    except Exception as e:
+        logger.warning(f"Chart selection failed: {e}")
+    return None
+
+
+def _safe_serialize(df: pd.DataFrame) -> list:
+    """Serialize DataFrame to JSON-safe records."""
+    records = []
+    for _, row in df.iterrows():
+        rec = {}
+        for col, val in row.items():
+            try:
+                is_na = pd.isna(val) if not isinstance(val, (list, dict)) else False
+            except Exception:
+                is_na = False
+            if is_na:
+                rec[col] = None
+            elif isinstance(val, float) and (val in (float("inf"), float("-inf"))):
+                rec[col] = None
+            else:
+                try:
+                    rec[col] = val.item() if hasattr(val, "item") else val
+                except Exception:
+                    rec[col] = str(val)
+        records.append(rec)
+    return records
+
+
+--------------------------------------------------------------------------------
+BACKEND — MODIFY: backend/main.py
+--------------------------------------------------------------------------------
+
+Add these two lines (do not change anything else):
+
+  from routers.voice_insight import router as voice_insight_router
+  app.include_router(voice_insight_router, prefix="/api/voice-insight", tags=["Voice Insight"])
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/voice/GlobalVoiceTrigger.tsx
+--------------------------------------------------------------------------------
+
+This is the floating microphone button that lives on the dashboard canvas.
+It overlays existing content — does NOT replace or modify any existing component.
+
+Implementation requirements:
+
+VISUAL DESIGN:
+  - Floating action button (FAB), fixed position: bottom-right of viewport
+  - Size: 56px circle
+  - Default state: microphone icon, subtle border (var(--color-border-secondary))
+  - Recording state: pulsing red ring animation (CSS keyframes, no library)
+  - Processing state: spinner animation
+  - Done state: green checkmark for 1.5s then reset to default
+  - Tooltip on hover: "Ask your data anything"
+  - Z-index: 9999 (always on top)
+
+RECORDING FLOW:
+  Step 1: User clicks button → request microphone permission
+    - If denied: show toast "Microphone access required"
+    - If granted: start MediaRecorder (audio/webm;codecs=opus)
+  Step 2: Recording active → button pulses red, "Listening..." label appears below
+    - Auto-stop after 15 seconds (prevent runaway recording)
+    - User can click again to stop manually
+  Step 3: Stop → show processing spinner → POST blob to /api/voice-insight/transcribe-and-render
+    - Include dataset_id from Zustand datasetStore
+  Step 4a: SUCCESS response:
+    - Show toast: "Heard: [transcript]"
+    - If chart_config present: dispatch to dashboardStore.addVoiceTile(suggested_tile)
+    - Speak summary via /api/voice-insight/speak-insight (play returned audio_base64)
+    - Show ResultPreviewModal (see below)
+  Step 4b: ERROR response:
+    - Show toast with error message
+    - Reset button to default state
+
+RESULT PREVIEW MODAL:
+  - Small modal (400px wide, not full-screen) that slides up from bottom-right
+  - Shows: transcript, AI summary, mini chart preview (using existing ChartCard)
+  - Two buttons: "Add to Dashboard" and "Dismiss"
+  - "Add to Dashboard" → calls dashboardStore.addVoiceTile → closes modal
+  - Auto-dismisses after 8 seconds if no action
+  - Does NOT block the dashboard behind it (use pointer-events carefully)
+
+PROPS:
+  - No required props (reads datasetId from Zustand store directly)
+
+STATE (internal):
+  - status: "idle" | "recording" | "processing" | "done" | "error"
+  - transcript: string
+  - previewResult: VoiceInsightResult | null
+  - showPreview: boolean
+
+TYPES (add to frontend/src/types/index.ts):
+
+  interface VoiceInsightResult {
+    success: boolean;
+    transcript: string;
+    intent: { op: string; [key: string]: any };
+    summary: string;
+    chart_config: ChartConfig | null;
+    result: Record<string, any>[];
+    columns: string[];
+    total_rows: number;
+    truncated: boolean;
+    suggested_tile: {
+      title: string;
+      source: "voice";
+      chart_config: ChartConfig | null;
+    };
+    error?: string;
+  }
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/api/voiceInsight.ts
+--------------------------------------------------------------------------------
+
+  import axios from "axios";
+  const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+
+  export async function transcribeAndRender(
+    audioBlob: Blob,
+    datasetId: string
+  ): Promise<VoiceInsightResult> {
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "voice.webm");
+    formData.append("dataset_id", datasetId);
+    const res = await axios.post(`${BASE}/voice-insight/transcribe-and-render`, formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 60000,
+    });
+    return res.data;
+  }
+
+  export async function speakInsight(text: string): Promise<string> {
+    // Returns base64 WAV audio string
+    const res = await axios.post(`${BASE}/voice-insight/speak-insight`, null, {
+      params: { text: text.slice(0, 800) },
+      timeout: 30000,
+    });
+    return res.data.audio_base64;
+  }
+
+  // Helper: play base64 WAV in browser
+  export function playBase64Audio(base64: string): void {
+    const audio = new Audio(`data:audio/wav;base64,${base64}`);
+    audio.play().catch(() => {}); // Ignore autoplay restrictions gracefully
+  }
+
+
+--------------------------------------------------------------------------------
+FRONTEND — MODIFY: frontend/src/stores/dashboardStore.ts
+--------------------------------------------------------------------------------
+
+ADD this action to the existing Zustand dashboardStore (do not change anything else):
+
+  addVoiceTile: (tile: { title: string; source: string; chart_config: ChartConfig | null }) => {
+    // Generate a new tile ID
+    const tileId = `voice_${Date.now()}`;
+    // Add tile to existing tiles array at the end
+    set(state => ({
+      tiles: [
+        ...state.tiles,
+        {
+          id: tileId,
+          title: tile.title,
+          chart_type: tile.chart_config?.type || "bar",
+          chart_config: tile.chart_config,
+          source: "voice",
+          w: 6,   // half-width tile by default
+          h: 4,
+          x: 0,
+          y: Infinity, // react-grid-layout puts it at bottom
+        }
+      ]
+    }));
+  }
+
+
+--------------------------------------------------------------------------------
+FRONTEND — MODIFY: frontend/src/pages/DashboardPage.tsx
+--------------------------------------------------------------------------------
+
+Add ONE line to the JSX of DashboardPage (do not change anything else):
+Import GlobalVoiceTrigger and render it at the bottom of the component return,
+outside all other elements:
+
+  import GlobalVoiceTrigger from "../components/voice/GlobalVoiceTrigger";
+
+  // Inside return(), after the closing tag of the main content div:
+  <GlobalVoiceTrigger />
+
+
+--------------------------------------------------------------------------------
+EDGE CASES — FEATURE 1
+--------------------------------------------------------------------------------
+
+  - Microphone permission denied → toast error, button resets, no crash
+  - Silent audio (RMS < 100) → backend rejects with clear message
+  - Audio > 25MB → rejected client-side before upload with size message
+  - Recording exceeds 15s → auto-stopped, processing begins
+  - Whisper transcription returns empty string → show "Could not understand, try again"
+  - Language confidence < 60% → return low-confidence warning with transcript
+  - dataset_id not set (user not on dashboard) → toast "Load a dataset first"
+  - Intent classified as "clarify" → show clarification message in preview modal
+  - Intent classified as "unknown" → show helpful suggestions in preview modal
+  - chart_config is null (e.g. describe result) → preview shows data table only
+  - TTS playback blocked by browser autoplay policy → fail silently, no error shown
+  - Network timeout (LLM slow) → show "This is taking longer than usual..." after 10s
+  - Multiple clicks during processing → ignore subsequent clicks (disabled state)
+  - User closes browser tab mid-recording → MediaRecorder cleanup runs in finally block
+
+
+================================================================================
+FEATURE 2 — "WHAT-IF" PREDICTIVE SCENARIO MODELING
+================================================================================
+
+WHAT IT DOES
+------------
+A new interactive panel accessible from the dashboard. Users drag sliders
+to simulate business changes (e.g., "Increase prices by 10%", "Reduce costs
+by 15%"). As they drag, AI recalculates all KPIs and updates charts in
+real-time (debounced 300ms) to show projected impact.
+
+Uses the trained ML model (from existing ML agent) to power predictions.
+If no model exists, falls back to linear extrapolation on KPI columns.
+
+The existing /api/ml/what-if endpoint handles single simulations.
+This feature adds a MULTI-PARAMETER real-time panel on top of it.
+
+--------------------------------------------------------------------------------
+BACKEND — NEW FILE: backend/routers/scenario.py
+--------------------------------------------------------------------------------
+
+Register in main.py at prefix="/api/scenario".
+
+"""
+Scenario Modeling Route
+Multi-parameter what-if simulation with real-time KPI recalculation.
+"""
+
+import logging
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Any
+
+from database.db import get_dataset_from_db     # EXISTING
+from services.kpi_engine import compute_kpis    # EXISTING
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+class SliderParam(BaseModel):
+    """One adjustable parameter in the scenario."""
+    column: str                    # Which numeric column to modify
+    label: str                     # Human-readable label (e.g. "Marketing Spend")
+    change_pct: float = Field(ge=-100.0, le=500.0)  # % change from baseline (-100 to +500)
+    change_type: str = "multiply"  # "multiply" | "add" | "set"
+    # change_type=multiply: new_val = val * (1 + change_pct/100)
+    # change_type=add: new_val = val + (val * change_pct/100) as absolute
+    # change_type=set: new_val = change_pct (used as absolute value)
+
+
+class ScenarioRequest(BaseModel):
+    dataset_id: str
+    parameters: List[SliderParam]  # All active sliders
+    target_columns: Optional[List[str]] = None  # KPIs to recalculate
+
+
+class ScenarioResult(BaseModel):
+    baseline_kpis: Dict[str, Any]
+    projected_kpis: Dict[str, Any]
+    delta_kpis: Dict[str, Any]        # percentage change per KPI
+    chart_configs: List[Dict]          # Before/after comparison charts
+    narrative: str                     # One-sentence AI summary
+
+
+@router.post("/simulate", response_model=ScenarioResult)
+async def simulate_scenario(req: ScenarioRequest):
+    """
+    Apply parameter changes to a copy of the dataset,
+    recalculate KPIs, return before/after comparison.
+    This runs synchronously and fast (pandas only, no LLM call).
+    Typical response time: 200-800ms.
+    """
+    doc = await get_dataset_from_db(req.dataset_id)
+    if not doc:
+        raise HTTPException(404, "Dataset not found.")
+    if not doc.get("schema"):
+        raise HTTPException(400, "Generate dashboard first.")
+
+    try:
+        df_baseline = pd.read_json(doc["df_json"], orient="split")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load dataset: {e}")
+
+    schema = doc["schema"]
+
+    # Validate all parameter columns exist and are numeric
+    numeric_cols = schema.get("numerical_columns", [])
+    for param in req.parameters:
+        if param.column not in df_baseline.columns:
+            raise HTTPException(422, f"Column '{param.column}' not found.")
+        if param.column not in numeric_cols:
+            raise HTTPException(422, f"Column '{param.column}' is not numeric.")
+
+    # Apply changes to a copy
+    df_projected = df_baseline.copy()
+    for param in req.parameters:
+        if param.change_type == "multiply":
+            multiplier = 1.0 + (param.change_pct / 100.0)
+            df_projected[param.column] = df_projected[param.column] * multiplier
+        elif param.change_type == "add":
+            delta = df_baseline[param.column].mean() * (param.change_pct / 100.0)
+            df_projected[param.column] = df_projected[param.column] + delta
+        elif param.change_type == "set":
+            df_projected[param.column] = param.change_pct
+
+    # Compute KPIs on both
+    target_cols = req.target_columns or schema.get("kpi_columns") or schema.get("numerical_columns", [])[:5]
+    baseline_kpis_raw = compute_kpis(df_baseline, schema, user_kpis=target_cols)
+    projected_kpis_raw = compute_kpis(df_projected, schema, user_kpis=target_cols)
+
+    # Convert to flat dicts: {column_label: {total, mean, trend, ...}}
+    baseline_kpis = {k["label"]: k for k in baseline_kpis_raw}
+    projected_kpis = {k["label"]: k for k in projected_kpis_raw}
+
+    # Compute deltas (% change per KPI)
+    delta_kpis = {}
+    for label in baseline_kpis:
+        b_total = baseline_kpis[label].get("total") or 0
+        p_total = projected_kpis.get(label, {}).get("total") or 0
+        if b_total != 0:
+            delta_kpis[label] = round((p_total - b_total) / abs(b_total) * 100, 2)
+        else:
+            delta_kpis[label] = 0.0
+
+    # Build before/after comparison charts
+    chart_configs = _build_comparison_charts(df_baseline, df_projected, target_cols, schema)
+
+    # Generate a simple narrative (no LLM — fast)
+    narrative = _generate_scenario_narrative(req.parameters, delta_kpis)
+
+    return ScenarioResult(
+        baseline_kpis=baseline_kpis,
+        projected_kpis=projected_kpis,
+        delta_kpis=delta_kpis,
+        chart_configs=chart_configs,
+        narrative=narrative
+    )
+
+
+@router.get("/parameters/{dataset_id}")
+async def get_scenario_parameters(dataset_id: str):
+    """
+    Return suggested slider parameters for this dataset.
+    Auto-selects the most interesting numeric columns.
+    """
+    doc = await get_dataset_from_db(dataset_id)
+    if not doc:
+        raise HTTPException(404, "Dataset not found.")
+    schema = doc.get("schema", {})
+
+    kpi_cols = schema.get("kpi_columns", [])
+    numeric_cols = schema.get("numerical_columns", [])
+    suggested = kpi_cols[:5] or numeric_cols[:5]
+
+    # Build suggested slider configs
+    params = []
+    for col in suggested:
+        col_info = schema.get("columns", {}).get(col, {})
+        params.append({
+            "column": col,
+            "label": col.replace("_", " ").title(),
+            "min_pct": -50,
+            "max_pct": 100,
+            "default_pct": 0,
+            "step": 1,
+            "current_mean": col_info.get("mean"),
+            "current_total": None,
+            "change_type": "multiply"
+        })
+
+    # Also suggest "target" KPIs to watch
+    targets = [c for c in numeric_cols if c not in suggested][:3]
+
+    return {
+        "parameters": params,
+        "watch_columns": targets,
+        "note": "Adjust sliders to simulate business scenarios. KPIs update in real-time."
+    }
+
+
+def _build_comparison_charts(
+    df_baseline: pd.DataFrame,
+    df_projected: pd.DataFrame,
+    target_cols: List[str],
+    schema: dict
+) -> List[Dict]:
+    """Build side-by-side comparison charts for before/after."""
+    charts = []
+    time_col = schema.get("primary_time_column")
+
+    for col in target_cols[:3]:
+        if col not in df_baseline.columns:
+            continue
+        try:
+            if time_col and time_col in df_baseline.columns:
+                # Time-series comparison
+                base_ts = _resample_col(df_baseline, time_col, col)
+                proj_ts = _resample_col(df_projected, time_col, col)
+                data = []
+                for i, row in base_ts.iterrows():
+                    data.append({
+                        "period": str(row[time_col])[:10] if time_col in row else str(i),
+                        "baseline": round(float(row[col]), 2) if pd.notna(row[col]) else 0,
+                        "projected": round(float(proj_ts[col].iloc[i] if i < len(proj_ts) else 0), 2)
+                    })
+                charts.append({
+                    "type": "comparison_line",
+                    "title": f"{col.replace('_', ' ').title()} — Baseline vs Projected",
+                    "data": data,
+                    "xKey": "period",
+                    "baselineKey": "baseline",
+                    "projectedKey": "projected"
+                })
+            else:
+                # Simple bar comparison
+                charts.append({
+                    "type": "comparison_bar",
+                    "title": f"{col.replace('_', ' ').title()} — Baseline vs Projected",
+                    "data": [
+                        {"label": "Baseline", "value": round(float(df_baseline[col].sum()), 2)},
+                        {"label": "Projected", "value": round(float(df_projected[col].sum()), 2)}
+                    ],
+                    "xKey": "label",
+                    "yKey": "value"
+                })
+        except Exception as e:
+            logger.warning(f"Comparison chart failed for {col}: {e}")
+
+    return charts
+
+
+def _resample_col(df: pd.DataFrame, time_col: str, val_col: str) -> pd.DataFrame:
+    """Monthly resample of a column."""
+    try:
+        temp = df[[time_col, val_col]].copy()
+        temp[time_col] = pd.to_datetime(temp[time_col], errors="coerce")
+        return temp.set_index(time_col)[val_col].resample("ME").sum().reset_index()
+    except Exception:
+        return df[[time_col, val_col]].head(12)
+
+
+def _generate_scenario_narrative(params: List[SliderParam], delta_kpis: Dict[str, float]) -> str:
+    """Fast rule-based narrative — no LLM needed here."""
+    if not params or not delta_kpis:
+        return "No significant impact detected with current parameters."
+
+    param_desc = ", ".join(
+        f"{p.label} {'+' if p.change_pct >= 0 else ''}{p.change_pct:.0f}%"
+        for p in params
+        if p.change_pct != 0
+    )
+    if not param_desc:
+        return "No changes applied yet. Drag a slider to simulate."
+
+    biggest_delta_label = max(delta_kpis, key=lambda k: abs(delta_kpis[k]))
+    biggest_delta_val = delta_kpis[biggest_delta_label]
+    direction = "increase" if biggest_delta_val > 0 else "decrease"
+
+    return (
+        f"With {param_desc}, the model projects a {abs(biggest_delta_val):.1f}% "
+        f"{direction} in {biggest_delta_label}."
+    )
+
+
+--------------------------------------------------------------------------------
+BACKEND — MODIFY: backend/main.py
+--------------------------------------------------------------------------------
+
+Add (do not change anything else):
+
+  from routers.scenario import router as scenario_router
+  app.include_router(scenario_router, prefix="/api/scenario", tags=["Scenario"])
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/scenario/WhatIfPanel.tsx
+--------------------------------------------------------------------------------
+
+This is a full slide-over panel (right side, 420px wide) that appears when
+user clicks "What-If Simulator" button on the dashboard.
+
+LAYOUT (top to bottom):
+  ─────────────────────────────────────────
+  Panel Header: "What-If Scenario Modeling"  [×]
+  ─────────────────────────────────────────
+  Instructions text (small, muted):
+  "Drag sliders to simulate changes. KPIs update in real-time."
+  ─────────────────────────────────────────
+  PARAMETERS SECTION:
+    [Loading skeleton while fetching /api/scenario/parameters/{datasetId}]
+    For each parameter: SliderControl component (see below)
+  ─────────────────────────────────────────
+  [Reset All] button — resets all sliders to 0
+  ─────────────────────────────────────────
+  RESULTS SECTION (appears after first simulation):
+    Narrative text (italic, accent color)
+    ─────────────────
+    KPI DELTA GRID:
+      For each KPI: DeltaKPICard (see below)
+    ─────────────────
+    COMPARISON CHARTS:
+      For each chart_config: ComparisonChart component
+  ─────────────────────────────────────────
+
+BEHAVIOR:
+  - On mount: fetch GET /api/scenario/parameters/{datasetId}
+  - Debounce slider changes 300ms before calling POST /api/scenario/simulate
+  - Show subtle loading spinner on results section during debounced call
+  - If simulation fails: show error toast, keep last good results
+  - Panel is dismissable by clicking ×, pressing Escape, or clicking outside
+
+ANIMATION:
+  - Panel slides in from the right (CSS transform translateX)
+  - Transition: 250ms ease-out
+  - Background overlay: rgba(0,0,0,0.3) behind panel
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/scenario/SliderControl.tsx
+--------------------------------------------------------------------------------
+
+Single slider for one parameter.
+
+PROPS:
+  - column: string
+  - label: string
+  - value: number (current %)
+  - min: number (default -50)
+  - max: number (default 100)
+  - step: number (default 1)
+  - onChange: (column: string, value: number) => void
+
+DESIGN:
+  - Label row: "[Label]" on left, "[+X%]" on right (colored: green if positive, red if negative, gray if zero)
+  - Range input (HTML native slider, styled with CSS)
+  - Three markers below slider: min / 0 / max
+  - Current value badge: large number centered below slider
+  - When value = 0: slider thumb is gray
+  - When value > 0: slider thumb is green
+  - When value < 0: slider thumb is red
+  - Smooth color transition on thumb: CSS transition 150ms
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/scenario/DeltaKPICard.tsx
+--------------------------------------------------------------------------------
+
+Shows one KPI's baseline vs projected vs delta.
+
+PROPS:
+  - label: string
+  - baseline: number | null
+  - projected: number | null
+  - delta_pct: number
+
+DESIGN:
+  - Small card (same style as existing KPICard)
+  - Top: label (muted, 12px)
+  - Middle row: baseline value → arrow → projected value
+  - Bottom: delta badge — "+12.3%" in green or "-4.1%" in red
+  - Arrow direction: ↑ green if positive, ↓ red if negative, → gray if zero
+  - Animated: when delta changes, the value transitions with a brief highlight
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/scenario/ComparisonChart.tsx
+--------------------------------------------------------------------------------
+
+Renders comparison_line or comparison_bar chart configs from the scenario API.
+
+For comparison_line: use Recharts LineChart with two Lines:
+  - "baseline" line: var(--color-text-secondary) dashed
+  - "projected" line: var(--color-accent) solid
+  - Legend: "Baseline" and "Projected"
+  - Tooltip shows both values
+
+For comparison_bar: use Recharts BarChart with two Bars side by side:
+  - "Baseline" bar: var(--color-text-tertiary)
+  - "Projected" bar: var(--color-text-success) or danger depending on delta
+
+PROPS:
+  - chart: { type, title, data, xKey, baselineKey?, projectedKey?, yKey? }
+  - height: number (default 200)
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/api/scenario.ts
+--------------------------------------------------------------------------------
+
+  import axios from "axios";
+  const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+
+  export interface SliderParam {
+    column: string;
+    label: string;
+    change_pct: number;
+    change_type: "multiply" | "add" | "set";
+  }
+
+  export interface ScenarioRequest {
+    dataset_id: string;
+    parameters: SliderParam[];
+    target_columns?: string[];
+  }
+
+  export const getScenarioParameters = (datasetId: string) =>
+    axios.get(`${BASE}/scenario/parameters/${datasetId}`).then(r => r.data);
+
+  export const simulateScenario = (req: ScenarioRequest) =>
+    axios.post(`${BASE}/scenario/simulate`, req, { timeout: 15000 }).then(r => r.data);
+
+
+--------------------------------------------------------------------------------
+FRONTEND — MODIFY: frontend/src/pages/DashboardPage.tsx
+--------------------------------------------------------------------------------
+
+Add ONE button to the dashboard header area (do not change anything else):
+  - "What-If Simulator" button with a sliders icon (Lucide: SlidersHorizontal)
+  - Clicking it sets local state showScenario=true which renders WhatIfPanel
+  - WhatIfPanel renders as a portal (or fixed positioned div) — not inside any grid
+
+  import WhatIfPanel from "../components/scenario/WhatIfPanel";
+  import { SlidersHorizontal } from "lucide-react";
+
+  // In component state:
+  const [showScenario, setShowScenario] = useState(false);
+
+  // In JSX header:
+  <button onClick={() => setShowScenario(true)}>
+    <SlidersHorizontal size={16} /> What-If Simulator
+  </button>
+
+  // At bottom of return():
+  {showScenario && <WhatIfPanel datasetId={datasetId} onClose={() => setShowScenario(false)} />}
+
+
+--------------------------------------------------------------------------------
+EDGE CASES — FEATURE 2
+--------------------------------------------------------------------------------
+
+  - Dataset has no numeric columns → show "No numeric columns found for simulation"
+  - All sliders at 0% → simulate returns "No changes applied" narrative
+  - change_pct validation: enforce -100 to +500 range in both Pydantic and slider
+  - A parameter column has all-zero values → division by zero in delta → show "N/A"
+  - ML model not trained → falls back to compute_kpis on modified df (no ML needed)
+  - Simulation takes >3s (large dataset) → show "Computing..." skeleton on results
+  - Debounce: rapid slider drag fires ONE call after 300ms idle, not one per pixel
+  - Panel open while dataset changes → re-fetch parameters on dataset_id change
+  - Scenario results become stale → show subtle "Recalculating..." overlay when debouncing
+  - User sets price to -100% (free) → show warning "Caution: 100% price reduction"
+  - Network error during simulation → toast "Simulation failed, showing last results"
+  - Close panel → all state reset (sliders back to 0, results cleared)
+
+
+================================================================================
+FEATURE 3 — MULTI-DATASET CROSS-CORRELATION ("DATA MESH")
+================================================================================
+
+WHAT IT DOES
+------------
+User selects two uploaded datasets. AI detects possible join columns (by name
+similarity and type matching), performs an on-the-fly merge, then runs
+cross-dataset correlation analysis with LLM narration:
+"Is there a correlation between team turnover and regional sales drops?"
+
+--------------------------------------------------------------------------------
+BACKEND — NEW FILE: backend/routers/data_mesh.py
+--------------------------------------------------------------------------------
+
+Register in main.py at prefix="/api/data-mesh".
+
+"""
+Data Mesh Route — Multi-Dataset Cross-Correlation Analysis
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+
+from database.db import get_dataset_from_db       # EXISTING
+from utils.llm import call_llm                     # EXISTING
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+class MergeConfig(BaseModel):
+    dataset_id_a: str
+    dataset_id_b: str
+    join_key_a: str                  # Column from dataset A to join on
+    join_key_b: str                  # Column from dataset B to join on
+    join_type: str = "inner"         # "inner" | "left" | "outer"
+    user_question: Optional[str] = None  # e.g. "Is turnover linked to sales drops?"
+
+
+class JoinSuggestion(BaseModel):
+    col_a: str
+    col_b: str
+    confidence: float                # 0.0–1.0
+    reason: str                      # "same name", "similar name", "same dtype + cardinality"
+
+
+@router.post("/suggest-joins")
+async def suggest_join_keys(dataset_id_a: str, dataset_id_b: str):
+    """
+    Auto-detect candidate join columns between two datasets.
+    Uses name matching + type + cardinality heuristics. No LLM needed.
+    Returns top-5 suggestions sorted by confidence.
+    """
+    doc_a = await get_dataset_from_db(dataset_id_a)
+    doc_b = await get_dataset_from_db(dataset_id_b)
+    if not doc_a:
+        raise HTTPException(404, f"Dataset A ({dataset_id_a}) not found.")
+    if not doc_b:
+        raise HTTPException(404, f"Dataset B ({dataset_id_b}) not found.")
+
+    try:
+        df_a = pd.read_json(doc_a["df_json"], orient="split")
+        df_b = pd.read_json(doc_b["df_json"], orient="split")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load datasets: {e}")
+
+    suggestions = []
+
+    for col_a in df_a.columns:
+        for col_b in df_b.columns:
+            confidence, reason = _score_join_pair(df_a, df_b, col_a, col_b)
+            if confidence > 0.3:
+                suggestions.append(JoinSuggestion(
+                    col_a=col_a,
+                    col_b=col_b,
+                    confidence=round(confidence, 2),
+                    reason=reason
+                ))
+
+    suggestions.sort(key=lambda x: x.confidence, reverse=True)
+    return {
+        "suggestions": [s.dict() for s in suggestions[:5]],
+        "dataset_a_name": doc_a.get("filename", dataset_id_a),
+        "dataset_b_name": doc_b.get("filename", dataset_id_b),
+        "dataset_a_cols": list(df_a.columns),
+        "dataset_b_cols": list(df_b.columns),
+    }
+
+
+@router.post("/analyze")
+async def cross_dataset_analysis(config: MergeConfig):
+    """
+    1. Load both datasets
+    2. Validate join keys
+    3. Perform merge
+    4. Run cross-dataset correlation
+    5. Detect shared anomalies
+    6. LLM narration of findings
+    """
+    doc_a = await get_dataset_from_db(config.dataset_id_a)
+    doc_b = await get_dataset_from_db(config.dataset_id_b)
+    if not doc_a or not doc_b:
+        raise HTTPException(404, "One or both datasets not found.")
+
+    try:
+        df_a = pd.read_json(doc_a["df_json"], orient="split")
+        df_b = pd.read_json(doc_b["df_json"], orient="split")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load: {e}")
+
+    # Validate join keys
+    if config.join_key_a not in df_a.columns:
+        raise HTTPException(422, f"Join key '{config.join_key_a}' not in Dataset A.")
+    if config.join_key_b not in df_b.columns:
+        raise HTTPException(422, f"Join key '{config.join_key_b}' not in Dataset B.")
+
+    # Rename join key in B to match A for merge
+    df_b_renamed = df_b.rename(columns={config.join_key_b: config.join_key_a})
+
+    # Add suffixes to avoid column name collision
+    df_merged = pd.merge(
+        df_a, df_b_renamed,
+        on=config.join_key_a,
+        how=config.join_type,
+        suffixes=("_A", "_B")
+    )
+
+    if df_merged.empty:
+        return {
+            "success": False,
+            "error": "No matching rows found. Try a different join key or join type (left/outer).",
+            "merged_rows": 0
+        }
+
+    # Cap merged dataset for analysis
+    if len(df_merged) > 50000:
+        df_merged = df_merged.sample(50000, random_state=42)
+
+    # Cross-dataset correlation
+    num_cols = df_merged.select_dtypes(include="number").columns.tolist()
+    correlations = []
+    if len(num_cols) >= 2:
+        corr_matrix = df_merged[num_cols].corr(numeric_only=True)
+        cols_a = [c for c in num_cols if c.endswith("_A") or (c in df_a.columns and c not in df_b.columns)]
+        cols_b = [c for c in num_cols if c.endswith("_B") or (c in df_b.columns and c not in df_a.columns)]
+
+        for ca in cols_a[:5]:
+            for cb in cols_b[:5]:
+                if ca in corr_matrix.index and cb in corr_matrix.columns:
+                    r = corr_matrix.loc[ca, cb]
+                    if not pd.isna(r) and abs(r) > 0.3:
+                        correlations.append({
+                            "col_a": ca, "col_b": cb,
+                            "r": round(float(r), 3),
+                            "strength": "strong" if abs(r) > 0.7 else "moderate",
+                            "direction": "positive" if r > 0 else "negative"
+                        })
+
+    correlations.sort(key=lambda x: abs(x["r"]), reverse=True)
+
+    # Build cross-dataset chart (scatter of top correlation pair)
+    cross_chart = None
+    if correlations:
+        top = correlations[0]
+        try:
+            temp = df_merged[[top["col_a"], top["col_b"]]].dropna().sample(min(500, len(df_merged)), random_state=42)
+            cross_chart = {
+                "type": "scatter",
+                "title": f"Cross-Dataset: {top['col_a']} vs {top['col_b']} (r={top['r']})",
+                "data": [{"x": float(row[top["col_a"]]), "y": float(row[top["col_b"]])} for _, row in temp.iterrows()],
+                "xKey": "x", "yKey": "y"
+            }
+        except Exception:
+            pass
+
+    # LLM narration
+    narrative = await _narrate_cross_analysis(
+        correlations=correlations,
+        merged_rows=len(df_merged),
+        name_a=doc_a.get("filename", "Dataset A"),
+        name_b=doc_b.get("filename", "Dataset B"),
+        user_question=config.user_question
+    )
+
+    return {
+        "success": True,
+        "merged_rows": len(df_merged),
+        "correlations": correlations[:10],
+        "top_correlation": correlations[0] if correlations else None,
+        "cross_chart": cross_chart,
+        "narrative": narrative,
+        "merged_columns": list(df_merged.columns),
+        "datasets": {
+            "a": {"name": doc_a.get("filename"), "rows": len(df_a)},
+            "b": {"name": doc_b.get("filename"), "rows": len(df_b)}
+        }
+    }
+
+
+def _score_join_pair(df_a: pd.DataFrame, df_b: pd.DataFrame, col_a: str, col_b: str):
+    """Score how likely two columns are good join keys. Returns (confidence, reason)."""
+    score = 0.0
+    reasons = []
+
+    # Exact name match
+    if col_a.lower() == col_b.lower():
+        score += 0.5
+        reasons.append("exact name match")
+
+    # Similar name (one contains the other)
+    elif col_a.lower() in col_b.lower() or col_b.lower() in col_a.lower():
+        score += 0.3
+        reasons.append("similar name")
+
+    # Same dtype
+    if df_a[col_a].dtype == df_b[col_b].dtype:
+        score += 0.2
+        reasons.append("same dtype")
+
+    # Overlapping values (sample check)
+    try:
+        vals_a = set(df_a[col_a].dropna().astype(str).head(100))
+        vals_b = set(df_b[col_b].dropna().astype(str).head(100))
+        if vals_a and vals_b:
+            overlap = len(vals_a & vals_b) / max(len(vals_a), len(vals_b))
+            if overlap > 0.5:
+                score += 0.3
+                reasons.append(f"{overlap:.0%} value overlap")
+            elif overlap > 0.2:
+                score += 0.1
+                reasons.append(f"{overlap:.0%} partial overlap")
+    except Exception:
+        pass
+
+    return min(score, 1.0), ", ".join(reasons) or "low similarity"
+
+
+async def _narrate_cross_analysis(correlations, merged_rows, name_a, name_b, user_question):
+    """LLM narration of cross-dataset findings."""
+    if not correlations:
+        return f"No significant cross-dataset correlations found between {name_a} and {name_b} after merging {merged_rows:,} rows."
+
+    corr_text = "\n".join([
+        f"- {c['col_a']} vs {c['col_b']}: r={c['r']} ({c['strength']} {c['direction']} correlation)"
+        for c in correlations[:5]
+    ])
+    question_line = f"\nUser question: {user_question}" if user_question else ""
+
+    prompt = f"""You are a business intelligence analyst. Two datasets were merged ({merged_rows:,} matching rows):
+Dataset A: {name_a}
+Dataset B: {name_b}
+{question_line}
+
+Cross-dataset correlations found:
+{corr_text}
+
+Write a 2-3 sentence business insight explaining what these correlations mean.
+Be specific about which datasets and columns are correlated. State whether the user's question can be answered.
+Do not invent data not in the correlations above."""
+
+    try:
+        return await call_llm(
+            messages=[{"role": "user", "content": prompt}],
+            system="You are a concise, accurate business intelligence analyst. Never hallucinate data.",
+        )
+    except Exception:
+        top = correlations[0]
+        return f"Found a {top['strength']} {top['direction']} correlation (r={top['r']}) between {top['col_a']} ({name_a}) and {top['col_b']} ({name_b})."
+
+
+--------------------------------------------------------------------------------
+BACKEND — MODIFY: backend/main.py
+--------------------------------------------------------------------------------
+
+Add (do not change anything else):
+
+  from routers.data_mesh import router as data_mesh_router
+  app.include_router(data_mesh_router, prefix="/api/data-mesh", tags=["Data Mesh"])
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/datamesh/DataMeshPanel.tsx
+--------------------------------------------------------------------------------
+
+A full-page panel (accessible from a "Data Mesh" tab on the insights page
+or from the sidebar navigation).
+
+LAYOUT:
+  ─────────────────────────────────────────
+  Header: "Multi-Dataset Cross-Correlation"
+  ─────────────────────────────────────────
+  STEP 1 — SELECT DATASETS:
+    Dataset A: dropdown of all uploaded datasets
+    Dataset B: dropdown of all uploaded datasets (different from A)
+    [Find Join Keys] button → calls /api/data-mesh/suggest-joins
+  ─────────────────────────────────────────
+  STEP 2 — SELECT JOIN (appears after suggest-joins):
+    List of join suggestions as clickable cards:
+      "region (Dataset A) ↔ region_name (Dataset B)" — 87% match
+    User clicks one to select, or manually picks columns
+    Join type selector: Inner / Left / Outer
+  ─────────────────────────────────────────
+  STEP 3 — ASK A QUESTION (optional):
+    Text input: "What is your business question? (optional)"
+    e.g. "Is there a correlation between team turnover and sales drops?"
+    [Analyze Cross-Correlation] button → calls /api/data-mesh/analyze
+  ─────────────────────────────────────────
+  RESULTS (appears after analysis):
+    Narrative text (larger, prominent)
+    Merged rows count badge
+    Correlation table (col_a | col_b | r value | strength | direction)
+    Cross scatter chart (ChartCard with returned cross_chart config)
+  ─────────────────────────────────────────
+
+STATE:
+  - step: 1 | 2 | 3 | "results"
+  - datasetIdA, datasetIdB: string
+  - joinSuggestions: JoinSuggestion[]
+  - selectedJoin: { join_key_a, join_key_b, join_type }
+  - userQuestion: string
+  - analysisResult: CrossAnalysisResult | null
+  - loading: boolean
+  - error: string
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/api/dataMesh.ts
+--------------------------------------------------------------------------------
+
+  import axios from "axios";
+  const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+
+  export const suggestJoins = (datasetIdA: string, datasetIdB: string) =>
+    axios.get(`${BASE}/data-mesh/suggest-joins`, { params: { dataset_id_a: datasetIdA, dataset_id_b: datasetIdB } }).then(r => r.data);
+
+  export const analyzeCrossDataset = (config: {
+    dataset_id_a: string;
+    dataset_id_b: string;
+    join_key_a: string;
+    join_key_b: string;
+    join_type: string;
+    user_question?: string;
+  }) => axios.post(`${BASE}/data-mesh/analyze`, config, { timeout: 60000 }).then(r => r.data);
+
+
+--------------------------------------------------------------------------------
+EDGE CASES — FEATURE 3
+--------------------------------------------------------------------------------
+
+  - User selects same dataset for A and B → disable "Find Join Keys" button, show warning
+  - No overlapping join candidates (score all < 0.3) → show "No obvious join key found. Select manually."
+  - Merged result is empty → return clear message with suggestion to try "left" join
+  - Merged dataset > 50,000 rows → auto-sample with notice "Sampled 50K rows for analysis"
+  - Dataset B has no numeric columns → still merge, but skip correlation, show join result only
+  - LLM narration fails → fall back to rule-based one-sentence summary (already in code)
+  - Both datasets have column called "id" → these are likely not meaningful join keys (filter ID columns from suggestions)
+  - Join produces massive cross-join (many-to-many) → detect via (rows_merged > rows_a * 10), warn user
+  - One dataset not yet processed (no schema) → show "Please generate dashboard for this dataset first"
+
+
+================================================================================
+FEATURE 4 — LIVE DATABASE AGENT (TEXT-TO-SQL)
+================================================================================
+
+WHAT IT DOES
+------------
+User can connect a live database (SQLite file upload, or PostgreSQL/MySQL
+connection string). The agent inspects the schema, lets user ask natural
+language questions, and executes safe read-only SQL against the live database.
+
+IMPORTANT: Only SELECT queries allowed. No INSERT/UPDATE/DELETE/DROP.
+For demo safety, SQLite file upload is the primary path.
+PostgreSQL/MySQL connection strings are supported but explicitly documented
+as requiring the user's own database.
+
+--------------------------------------------------------------------------------
+BACKEND — NEW FILE: backend/routers/db_agent.py
+--------------------------------------------------------------------------------
+
+Register in main.py at prefix="/api/db-agent".
+
+"""
+Live Database Agent — Text-to-SQL with schema inspection.
+Supports: SQLite (file upload), PostgreSQL, MySQL.
+SAFETY: Only SELECT queries. No DDL. No DML.
+"""
+
+import os
+import re
+import uuid
+import logging
+import tempfile
+import aiofiles
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from pydantic import BaseModel
+
+from utils.llm import call_llm   # EXISTING
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# In-memory registry of connected databases for this session
+# {connection_id: {type, engine, schema_summary, name}}
+_connections: Dict[str, Any] = {}
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/talking_bi")
+MAX_RESULT_ROWS = 1000
+BLOCKED_KEYWORDS = re.compile(
+    r'\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE|GRANT|REVOKE|COMMIT|ROLLBACK)\b',
+    re.IGNORECASE
+)
+
+
+class PostgresConfig(BaseModel):
+    host: str
+    port: int = 5432
+    database: str
+    username: str
+    password: str
+    name: str = "PostgreSQL DB"
+
+
+class MySQLConfig(BaseModel):
+    host: str
+    port: int = 3306
+    database: str
+    username: str
+    password: str
+    name: str = "MySQL DB"
+
+
+class SQLQueryRequest(BaseModel):
+    connection_id: str
+    question: str     # Natural language question
+
+
+class DirectSQLRequest(BaseModel):
+    connection_id: str
+    sql: str          # Direct SQL (for review mode)
+
+
+@router.post("/connect/sqlite")
+async def connect_sqlite(file: UploadFile = File(...)):
+    """Upload a SQLite .db file and connect to it."""
+    if not file.filename.endswith((".db", ".sqlite", ".sqlite3")):
+        raise HTTPException(400, "Only .db, .sqlite, .sqlite3 files supported.")
+    content = await file.read()
+    if len(content) > 100 * 1024 * 1024:
+        raise HTTPException(400, "SQLite file too large (max 100MB).")
+
+    conn_id = str(uuid.uuid4())
+    db_path = os.path.join(UPLOAD_DIR, "dbs", f"{conn_id}.db")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    async with aiofiles.open(db_path, "wb") as f:
+        await f.write(content)
+
+    schema = _inspect_sqlite(db_path)
+    _connections[conn_id] = {
+        "type": "sqlite",
+        "path": db_path,
+        "schema": schema,
+        "name": file.filename
+    }
+    return {"connection_id": conn_id, "name": file.filename, "schema": schema}
+
+
+@router.post("/connect/postgres")
+async def connect_postgres(config: PostgresConfig):
+    """Connect to a PostgreSQL database."""
+    try:
+        import sqlalchemy
+        url = f"postgresql+psycopg2://{config.username}:{config.password}@{config.host}:{config.port}/{config.database}"
+        engine = sqlalchemy.create_engine(url, connect_args={"connect_timeout": 10})
+        with engine.connect() as conn:
+            conn.execute(sqlalchemy.text("SELECT 1"))  # test connection
+        schema = _inspect_sqlalchemy(engine)
+        conn_id = str(uuid.uuid4())
+        _connections[conn_id] = {"type": "postgres", "engine": engine, "schema": schema, "name": config.name}
+        return {"connection_id": conn_id, "name": config.name, "schema": schema}
+    except ImportError:
+        raise HTTPException(500, "psycopg2 not installed. Run: pip install psycopg2-binary")
+    except Exception as e:
+        raise HTTPException(400, f"Connection failed: {str(e)}")
+
+
+@router.post("/connect/mysql")
+async def connect_mysql(config: MySQLConfig):
+    """Connect to a MySQL database."""
+    try:
+        import sqlalchemy
+        url = f"mysql+pymysql://{config.username}:{config.password}@{config.host}:{config.port}/{config.database}"
+        engine = sqlalchemy.create_engine(url, connect_args={"connect_timeout": 10})
+        with engine.connect() as conn:
+            conn.execute(sqlalchemy.text("SELECT 1"))
+        schema = _inspect_sqlalchemy(engine)
+        conn_id = str(uuid.uuid4())
+        _connections[conn_id] = {"type": "mysql", "engine": engine, "schema": schema, "name": config.name}
+        return {"connection_id": conn_id, "name": config.name, "schema": schema}
+    except ImportError:
+        raise HTTPException(500, "PyMySQL not installed. Run: pip install pymysql")
+    except Exception as e:
+        raise HTTPException(400, f"Connection failed: {str(e)}")
+
+
+@router.post("/query")
+async def natural_language_query(req: SQLQueryRequest):
+    """
+    Convert natural language → SQL → execute → return results.
+    Pipeline:
+      1. Get schema for this connection
+      2. LLM generates SQL
+      3. Safety check (block non-SELECT)
+      4. Execute SQL
+      5. Return results + generated SQL (shown to user for transparency)
+    """
+    conn = _connections.get(req.connection_id)
+    if not conn:
+        raise HTTPException(404, "Connection not found. Please reconnect.")
+
+    schema = conn["schema"]
+
+    # Generate SQL via LLM
+    sql = await _generate_sql(req.question, schema, conn["name"])
+
+    # Safety check
+    is_safe, safety_error = _check_sql_safety(sql)
+    if not is_safe:
+        return {
+            "success": False,
+            "error": safety_error,
+            "generated_sql": sql,
+            "requires_review": True
+        }
+
+    # Execute
+    try:
+        rows, columns = _execute_sql(conn, sql)
+        return {
+            "success": True,
+            "generated_sql": sql,
+            "columns": columns,
+            "rows": rows[:MAX_RESULT_ROWS],
+            "total_rows": len(rows),
+            "truncated": len(rows) > MAX_RESULT_ROWS,
+            "question": req.question
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"SQL execution failed: {str(e)}",
+            "generated_sql": sql,
+            "requires_review": True
+        }
+
+
+@router.post("/execute-reviewed")
+async def execute_reviewed_sql(req: DirectSQLRequest):
+    """
+    Execute a SQL query that the user has reviewed and approved.
+    Still enforces SELECT-only safety.
+    """
+    conn = _connections.get(req.connection_id)
+    if not conn:
+        raise HTTPException(404, "Connection not found.")
+
+    is_safe, error = _check_sql_safety(req.sql)
+    if not is_safe:
+        raise HTTPException(422, f"Unsafe SQL blocked: {error}")
+
+    try:
+        rows, columns = _execute_sql(conn, req.sql)
+        return {
+            "success": True,
+            "columns": columns,
+            "rows": rows[:MAX_RESULT_ROWS],
+            "total_rows": len(rows),
+            "truncated": len(rows) > MAX_RESULT_ROWS
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Execution failed: {str(e)}")
+
+
+@router.get("/connections")
+async def list_connections():
+    """List all active connections for this session."""
+    return [
+        {"connection_id": cid, "name": c["name"], "type": c["type"]}
+        for cid, c in _connections.items()
+    ]
+
+
+@router.delete("/connections/{connection_id}")
+async def disconnect(connection_id: str):
+    """Remove a connection from the registry."""
+    if connection_id in _connections:
+        conn = _connections.pop(connection_id)
+        if conn["type"] == "sqlite":
+            try: os.unlink(conn["path"])
+            except Exception: pass
+    return {"success": True}
+
+
+# ── HELPERS ────────────────────────────────────────────────────────────────
+
+def _inspect_sqlite(db_path: str) -> Dict:
+    """Inspect SQLite schema."""
+    import sqlite3
+    schema = {"tables": {}}
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        for table in tables[:20]:  # cap at 20 tables
+            cursor.execute(f"PRAGMA table_info('{table}')")
+            cols = [{"name": row[1], "type": row[2]} for row in cursor.fetchall()]
+            cursor.execute(f"SELECT COUNT(*) FROM '{table}'")
+            row_count = cursor.fetchone()[0]
+            schema["tables"][table] = {"columns": cols, "row_count": row_count}
+        conn.close()
+    except Exception as e:
+        logger.error(f"SQLite inspection failed: {e}")
+    return schema
+
+
+def _inspect_sqlalchemy(engine) -> Dict:
+    """Inspect PostgreSQL/MySQL schema via SQLAlchemy."""
+    import sqlalchemy
+    schema = {"tables": {}}
+    try:
+        inspector = sqlalchemy.inspect(engine)
+        for table_name in inspector.get_table_names()[:20]:
+            cols = [{"name": c["name"], "type": str(c["type"])} for c in inspector.get_columns(table_name)]
+            schema["tables"][table_name] = {"columns": cols, "row_count": "unknown"}
+    except Exception as e:
+        logger.error(f"Schema inspection failed: {e}")
+    return schema
+
+
+def _schema_to_prompt(schema: Dict, db_name: str) -> str:
+    """Convert schema dict to LLM-readable string."""
+    lines = [f"Database: {db_name}", "Tables:"]
+    for table, info in schema.get("tables", {}).items():
+        col_str = ", ".join(f"{c['name']} ({c['type']})" for c in info.get("columns", [])[:15])
+        lines.append(f"  - {table} ({info.get('row_count', '?')} rows): {col_str}")
+    return "\n".join(lines)
+
+
+async def _generate_sql(question: str, schema: Dict, db_name: str) -> str:
+    """Generate SQL from natural language using LLM."""
+    schema_str = _schema_to_prompt(schema, db_name)
+    system = f"""You are an expert SQL generator.
+Given a database schema, generate a single, correct SQL SELECT query for the user's question.
+
+{schema_str}
+
+RULES:
+1. Return ONLY the SQL query. No explanation. No markdown. No semicolons at the end.
+2. Only generate SELECT queries. Never INSERT, UPDATE, DELETE, DROP, ALTER, CREATE.
+3. Use exact table and column names from the schema above.
+4. Add LIMIT 1000 to all queries.
+5. If the question can't be answered with this schema, return: SELECT 'Cannot answer this question with available tables'
+"""
+    try:
+        sql = await call_llm(
+            messages=[{"role": "user", "content": question}],
+            system=system,
+        )
+        # Strip markdown if LLM wraps it
+        sql = re.sub(r'^```sql\s*', '', sql.strip(), flags=re.MULTILINE)
+        sql = re.sub(r'```\s*$', '', sql, flags=re.MULTILINE)
+        return sql.strip()
+    except Exception as e:
+        raise Exception(f"SQL generation failed: {e}")
+
+
+def _check_sql_safety(sql: str) -> tuple[bool, str]:
+    """Block any non-SELECT operations."""
+    if BLOCKED_KEYWORDS.search(sql):
+        blocked = BLOCKED_KEYWORDS.findall(sql)
+        return False, f"Blocked operation: {blocked}. Only SELECT queries are allowed."
+    if not sql.strip().upper().startswith("SELECT"):
+        return False, "Only SELECT queries are permitted. This query appears to start differently."
+    return True, ""
+
+
+def _execute_sql(conn: Dict, sql: str) -> tuple[list, list]:
+    """Execute SQL against the appropriate connection type."""
+    if conn["type"] == "sqlite":
+        import sqlite3
+        db_conn = sqlite3.connect(conn["path"])
+        cursor = db_conn.cursor()
+        cursor.execute(sql)
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        rows = [list(row) for row in cursor.fetchmany(MAX_RESULT_ROWS + 1)]
+        db_conn.close()
+        return rows, columns
+    else:
+        import sqlalchemy
+        with conn["engine"].connect() as db_conn:
+            result = db_conn.execute(sqlalchemy.text(sql))
+            columns = list(result.keys())
+            rows = [list(row) for row in result.fetchmany(MAX_RESULT_ROWS + 1)]
+        return rows, columns
+
+
+--------------------------------------------------------------------------------
+BACKEND — MODIFY: backend/main.py
+--------------------------------------------------------------------------------
+
+Add (do not change anything else):
+
+  from routers.db_agent import router as db_agent_router
+  app.include_router(db_agent_router, prefix="/api/db-agent", tags=["DB Agent"])
+
+
+--------------------------------------------------------------------------------
+BACKEND — ADD TO: backend/requirements.txt
+--------------------------------------------------------------------------------
+
+  # Add if not present:
+  sqlalchemy==2.0.30
+  psycopg2-binary==2.9.9    # PostgreSQL support (optional, graceful fallback)
+  pymysql==1.1.0             # MySQL support (optional, graceful fallback)
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/dbagent/DatabaseConnector.tsx
+--------------------------------------------------------------------------------
+
+A panel accessible from the Upload page as a new tab: "Connect Database"
+(alongside existing "Upload File", "Scrape URL", "Connect API" tabs).
+
+TABS (inside this panel):
+  Tab 1: SQLite File
+    - File drop zone accepting .db, .sqlite, .sqlite3
+    - Upload button → calls /api/db-agent/connect/sqlite
+    - On success: shows schema explorer + chat interface
+  Tab 2: PostgreSQL
+    - Form: Host, Port, Database, Username, Password
+    - "Test & Connect" button → calls /api/db-agent/connect/postgres
+    - Warning banner: "Your database credentials are only stored in memory and cleared on server restart."
+  Tab 3: MySQL
+    - Same as PostgreSQL form with mysql-specific defaults
+
+AFTER CONNECTION (all tabs):
+  - Show: DB name + type badge + table list (collapsible accordion per table, showing columns)
+  - Chat interface (same style as existing ChatPanel):
+    - User types: "Show top 10 customers by order value"
+    - Backend returns: generated SQL + results table
+    - ALWAYS show the generated SQL in a code block below the query
+    - Button: "Edit & Re-run" → opens SQL in editable textarea → "Run" executes /api/db-agent/execute-reviewed
+    - This transparency lets users see and verify what SQL ran
+  - "Disconnect" button → calls DELETE /api/db-agent/connections/{id}
+
+REQUIRED: Show a persistent notice at top of database chat:
+  "Read-only mode: Only SELECT queries are executed. Your data is never modified."
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/api/dbAgent.ts
+--------------------------------------------------------------------------------
+
+  import axios from "axios";
+  const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+
+  export const connectSQLite = (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return axios.post(`${BASE}/db-agent/connect/sqlite`, formData).then(r => r.data);
+  };
+
+  export const connectPostgres = (config: object) =>
+    axios.post(`${BASE}/db-agent/connect/postgres`, config, { timeout: 15000 }).then(r => r.data);
+
+  export const connectMySQL = (config: object) =>
+    axios.post(`${BASE}/db-agent/connect/mysql`, config, { timeout: 15000 }).then(r => r.data);
+
+  export const queryDatabase = (connectionId: string, question: string) =>
+    axios.post(`${BASE}/db-agent/query`, { connection_id: connectionId, question }, { timeout: 30000 }).then(r => r.data);
+
+  export const executeReviewedSQL = (connectionId: string, sql: string) =>
+    axios.post(`${BASE}/db-agent/execute-reviewed`, { connection_id: connectionId, sql }, { timeout: 30000 }).then(r => r.data);
+
+  export const listConnections = () =>
+    axios.get(`${BASE}/db-agent/connections`).then(r => r.data);
+
+  export const disconnectDB = (connectionId: string) =>
+    axios.delete(`${BASE}/db-agent/connections/${connectionId}`).then(r => r.data);
+
+
+--------------------------------------------------------------------------------
+EDGE CASES — FEATURE 4
+--------------------------------------------------------------------------------
+
+  - Non-.db file uploaded as SQLite → rejected with clear message
+  - SQLite file > 100MB → rejected before writing to disk
+  - PostgreSQL connection timeout → HTTP 400 with "Connection failed: ..."
+  - LLM generates non-SELECT SQL → blocked by _check_sql_safety, returned with requires_review=true
+  - LLM generates SQL with wrong table name → execute fails, return SQL + error for user to fix
+  - Query returns 0 rows → show "No results" with SQL visible
+  - Query returns > 1000 rows → show first 1000 with "Showing first 1,000 of X rows" badge
+  - Database has > 20 tables → inspect first 20, show note "Showing 20 of X tables"
+  - psycopg2 not installed → graceful HTTP 500 with install instruction
+  - pymysql not installed → same
+  - Connection registry cleared on restart (in-memory) → show "Session expired, please reconnect"
+  - User edits SQL in review mode and adds DELETE → safety check blocks it again
+  - Multiple concurrent users (different sessions) → each has own connection registry entry (conn_id is UUID)
+  - SQLite file with no tables → return empty schema with warning
+  - Database column names have spaces → escape with quotes in generated SQL
+
+
+================================================================================
+FEATURE 5 — AUTOMATED "MORNING BRIEFING" DISPATCHER
+================================================================================
+
+WHAT IT DOES
+------------
+User sets a schedule (day of week + time). The backend automatically:
+  1. Reloads the dataset (or re-scrapes if it was a URL)
+  2. Re-runs the full agent pipeline
+  3. Generates a PDF executive summary
+  4. Emails it to specified recipients
+
+Uses Python's built-in `smtplib` (no third-party email library needed).
+Uses APScheduler for job scheduling (free, local).
+SMTP settings are configured via environment variables (works with Gmail,
+Outlook, or any SMTP server the user has).
+
+--------------------------------------------------------------------------------
+BACKEND — NEW FILE: backend/services/scheduler.py
+--------------------------------------------------------------------------------
+
+"""
+Briefing Scheduler Service
+Uses APScheduler to run scheduled briefing jobs.
+"""
+
+import os
+import logging
+import smtplib
+import io
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from typing import List, Optional
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+logger = logging.getLogger(__name__)
+
+_scheduler: Optional[AsyncIOScheduler] = None
+
+
+def get_scheduler() -> AsyncIOScheduler:
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = AsyncIOScheduler()
+        _scheduler.start()
+        logger.info("APScheduler started")
+    return _scheduler
+
+
+async def run_briefing_job(dataset_id: str, recipients: List[str], briefing_name: str):
+    """
+    The actual briefing job that runs on schedule.
+    1. Load dataset from DB
+    2. Re-run pipeline (insights + KPIs)
+    3. Generate PDF via existing report agent
+    4. Email PDF to recipients
+    """
+    logger.info(f"Running briefing job for dataset {dataset_id}")
+    try:
+        # Import here to avoid circular imports
+        from database.db import get_dataset_from_db
+        from agents.planner_agent import run_full_pipeline
+        from services.mongodb_service import update_dataset  # if using MongoDB, else SQLite equivalent
+
+        doc = await get_dataset_from_db(dataset_id)
+        if not doc:
+            logger.error(f"Briefing job: dataset {dataset_id} not found")
+            return
+
+        # Re-run pipeline
+        result = await run_full_pipeline(dataset_id, doc["df_json"])
+
+        # Generate PDF bytes using existing report agent logic
+        pdf_bytes = await _generate_pdf_bytes(
+            dataset_id=dataset_id,
+            insights=result.get("insights", []),
+            kpis=result.get("kpis", []),
+            schema=result.get("schema", {}),
+            briefing_name=briefing_name
+        )
+
+        # Send email
+        if pdf_bytes:
+            await _send_briefing_email(
+                recipients=recipients,
+                subject=f"Morning Briefing: {briefing_name}",
+                body_text=_build_email_body(result),
+                pdf_bytes=pdf_bytes,
+                attachment_name=f"{briefing_name.replace(' ', '_')}_briefing.pdf"
+            )
+            logger.info(f"Briefing sent to {recipients}")
+        else:
+            logger.error("PDF generation failed for briefing job")
+
+    except Exception as e:
+        logger.error(f"Briefing job failed: {e}", exc_info=True)
+
+
+async def _generate_pdf_bytes(dataset_id, insights, kpis, schema, briefing_name) -> Optional[bytes]:
+    """Generate PDF using existing ReportLab setup."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        import datetime
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=1*inch, bottomMargin=1*inch)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Title
+        title_style = ParagraphStyle("title", parent=styles["Heading1"], fontSize=24, spaceAfter=12)
+        story.append(Paragraph(f"Morning Briefing: {briefing_name}", title_style))
+        story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%A, %B %d, %Y at %I:%M %p')}", styles["Normal"]))
+        story.append(Spacer(1, 0.3*inch))
+
+        # Executive Summary
+        story.append(Paragraph("Executive Summary", styles["Heading2"]))
+        if insights:
+            for insight in insights[:5]:
+                story.append(Paragraph(f"• {insight}", styles["Normal"]))
+                story.append(Spacer(1, 0.1*inch))
+        story.append(Spacer(1, 0.2*inch))
+
+        # KPI Table
+        if kpis:
+            story.append(Paragraph("Key Performance Indicators", styles["Heading2"]))
+            kpi_data = [["Metric", "Total", "Mean", "Trend", "Growth"]]
+            for kpi in kpis[:8]:
+                def fmt(v): return f"{v:,.2f}" if isinstance(v, (int, float)) and v is not None else "—"
+                kpi_data.append([
+                    kpi.get("label", ""),
+                    fmt(kpi.get("total")),
+                    fmt(kpi.get("mean")),
+                    kpi.get("trend", "—"),
+                    f"{kpi.get('growth_pct', 0):.1f}%" if kpi.get("growth_pct") is not None else "—"
+                ])
+            t = Table(kpi_data, colWidths=[2.5*inch, 1.2*inch, 1.2*inch, 1*inch, 1*inch])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1a1a2e")),
+                ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+                ("FONTSIZE", (0,0), (-1,-1), 9),
+                ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
+                ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+                ("PADDING", (0,0), (-1,-1), 4),
+            ]))
+            story.append(t)
+
+        # Footer
+        story.append(Spacer(1, 0.5*inch))
+        story.append(Paragraph("Generated automatically by Talking BI", styles["Normal"]))
+
+        doc.build(story)
+        return buffer.getvalue()
+
+    except Exception as e:
+        logger.error(f"PDF generation failed: {e}")
+        return None
+
+
+def _build_email_body(result: dict) -> str:
+    """Build plain-text email body."""
+    insights = result.get("insights", [])
+    kpis = result.get("kpis", [])
+    lines = ["Your morning briefing is attached as a PDF.", "", "Quick Summary:"]
+    for insight in insights[:3]:
+        lines.append(f"  • {insight}")
+    if kpis:
+        lines.append("")
+        lines.append("Top KPIs:")
+        for kpi in kpis[:5]:
+            growth = f" ({kpi['growth_pct']:+.1f}%)" if kpi.get("growth_pct") is not None else ""
+            lines.append(f"  • {kpi['label']}: {kpi.get('total', 'N/A')}{growth}")
+    lines.extend(["", "—", "Talking BI Autonomous Briefing Service"])
+    return "\n".join(lines)
+
+
+async def _send_briefing_email(recipients, subject, body_text, pdf_bytes, attachment_name):
+    """Send email via SMTP using env variables."""
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASS", "")
+    smtp_from = os.getenv("SMTP_FROM", smtp_user)
+
+    if not smtp_user or not smtp_pass:
+        logger.error("SMTP_USER and SMTP_PASS not configured. Skipping email.")
+        return
+
+    msg = MIMEMultipart()
+    msg["From"] = smtp_from
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_text, "plain"))
+
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(pdf_bytes)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
+    msg.attach(part)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_from, recipients, msg.as_string())
+            logger.info(f"Email sent to {recipients}")
+    except Exception as e:
+        logger.error(f"SMTP send failed: {e}")
+        raise
+
+
+--------------------------------------------------------------------------------
+BACKEND — NEW FILE: backend/routers/briefing.py
+--------------------------------------------------------------------------------
+
+Register in main.py at prefix="/api/briefing".
+
+"""
+Morning Briefing Route — Schedule and manage automated briefing jobs.
+"""
+
+import re
+import logging
+from typing import List
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, field_validator
+
+from database.db import get_dataset_from_db    # EXISTING
+from services.scheduler import get_scheduler, run_briefing_job
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+# In-memory job registry {job_id: {dataset_id, recipients, schedule, name}}
+_jobs = {}
+
+
+class BriefingSchedule(BaseModel):
+    dataset_id: str
+    name: str                           # e.g. "Weekly Sales Briefing"
+    recipients: List[str]               # List of email addresses
+    schedule_day: str = "mon"           # mon|tue|wed|thu|fri|sat|sun|daily
+    schedule_hour: int = 8              # 0-23
+    schedule_minute: int = 0            # 0-59
+    timezone: str = "UTC"
+
+    @field_validator("recipients")
+    def validate_emails(cls, v):
+        for email in v:
+            if not EMAIL_REGEX.match(email):
+                raise ValueError(f"Invalid email: {email}")
+        if len(v) > 10:
+            raise ValueError("Maximum 10 recipients allowed.")
+        return v
+
+    @field_validator("schedule_hour")
+    def valid_hour(cls, v):
+        if not 0 <= v <= 23:
+            raise ValueError("Hour must be 0-23.")
+        return v
+
+    @field_validator("name")
+    def valid_name(cls, v):
+        if len(v) > 100:
+            raise ValueError("Name too long (max 100 chars).")
+        return v.strip()
+
+
+@router.post("/schedule")
+async def create_briefing_schedule(config: BriefingSchedule):
+    """Create a new scheduled briefing job."""
+    # Validate dataset exists
+    doc = await get_dataset_from_db(config.dataset_id)
+    if not doc:
+        raise HTTPException(404, "Dataset not found.")
+
+    # Build cron trigger
+    if config.schedule_day == "daily":
+        trigger = CronTrigger(hour=config.schedule_hour, minute=config.schedule_minute, timezone=config.timezone)
+    else:
+        day_map = {"mon": "mon", "tue": "tue", "wed": "wed", "thu": "thu", "fri": "fri", "sat": "sat", "sun": "sun"}
+        day = day_map.get(config.schedule_day, "mon")
+        trigger = CronTrigger(day_of_week=day, hour=config.schedule_hour, minute=config.schedule_minute, timezone=config.timezone)
+
+    scheduler = get_scheduler()
+    job = scheduler.add_job(
+        run_briefing_job,
+        trigger=trigger,
+        args=[config.dataset_id, config.recipients, config.name],
+        id=f"briefing_{config.dataset_id}_{len(_jobs)}",
+        name=config.name,
+        replace_existing=False,
+        max_instances=1
+    )
+
+    _jobs[job.id] = {
+        "job_id": job.id,
+        "dataset_id": config.dataset_id,
+        "name": config.name,
+        "recipients": config.recipients,
+        "schedule_day": config.schedule_day,
+        "schedule_hour": config.schedule_hour,
+        "schedule_minute": config.schedule_minute,
+        "timezone": config.timezone,
+        "next_run": str(job.next_run_time)
+    }
+
+    return {
+        "success": True,
+        "job_id": job.id,
+        "name": config.name,
+        "next_run": str(job.next_run_time),
+        "message": f"Briefing scheduled. First email sends at {job.next_run_time}."
+    }
+
+
+@router.post("/send-now/{job_id}")
+async def send_briefing_now(job_id: str):
+    """Manually trigger a briefing immediately (for testing)."""
+    job_info = _jobs.get(job_id)
+    if not job_info:
+        raise HTTPException(404, "Job not found.")
+    try:
+        await run_briefing_job(job_info["dataset_id"], job_info["recipients"], job_info["name"])
+        return {"success": True, "message": f"Briefing sent to {job_info['recipients']}"}
+    except Exception as e:
+        raise HTTPException(500, f"Briefing failed: {str(e)}")
+
+
+@router.get("/schedules")
+async def list_schedules():
+    """List all active briefing schedules."""
+    return list(_jobs.values())
+
+
+@router.delete("/schedule/{job_id}")
+async def delete_schedule(job_id: str):
+    """Cancel a scheduled briefing."""
+    scheduler = get_scheduler()
+    try:
+        scheduler.remove_job(job_id)
+    except Exception:
+        pass
+    _jobs.pop(job_id, None)
+    return {"success": True}
+
+
+@router.put("/schedule/{job_id}")
+async def update_schedule(job_id: str, config: BriefingSchedule):
+    """Update an existing schedule by deleting and recreating."""
+    await delete_schedule(job_id)
+    return await create_briefing_schedule(config)
+
+
+--------------------------------------------------------------------------------
+BACKEND — MODIFY: backend/main.py
+--------------------------------------------------------------------------------
+
+Add (do not change anything else):
+
+  from routers.briefing import router as briefing_router
+  app.include_router(briefing_router, prefix="/api/briefing", tags=["Briefing"])
+
+
+--------------------------------------------------------------------------------
+BACKEND — ADD TO: backend/requirements.txt
+--------------------------------------------------------------------------------
+
+  # Add if not present:
+  APScheduler==3.10.4
+  pytz==2024.1
+
+
+--------------------------------------------------------------------------------
+BACKEND — ADD TO: backend/.env.example
+--------------------------------------------------------------------------------
+
+  # Email (for Morning Briefing feature)
+  SMTP_HOST=smtp.gmail.com
+  SMTP_PORT=587
+  SMTP_USER=your_gmail@gmail.com
+  SMTP_PASS=your_app_password_here
+  SMTP_FROM=your_gmail@gmail.com
+  # For Gmail: use an App Password (16-char), not your main Gmail password.
+  # Generate at: myaccount.google.com/apppasswords
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/components/briefing/BriefingScheduler.tsx
+--------------------------------------------------------------------------------
+
+Accessible from the sidebar as "Briefings" nav item (add to existing Navbar).
+
+LAYOUT:
+  ─────────────────────────────────────────
+  Header: "Automated Morning Briefings"
+  Subtitle: "Schedule AI-generated PDF reports delivered to your inbox"
+  ─────────────────────────────────────────
+  CREATE NEW BRIEFING FORM:
+    Dataset selector (dropdown of all uploaded datasets)
+    Briefing Name: text input
+    Recipients: tag input (type email, press Enter to add, ×  to remove)
+    Schedule:
+      Day: [Daily | Mon | Tue | Wed | Thu | Fri | Sat | Sun] (button group)
+      Time: [Hour dropdown 1-12] [AM/PM toggle] [Minute :00/:15/:30/:45]
+      Timezone: text input (default UTC)
+    [Schedule Briefing] button (primary)
+    [Send Test Now] button (secondary, appears after scheduling)
+  ─────────────────────────────────────────
+  ACTIVE SCHEDULES (list, if any):
+    For each schedule, a card showing:
+      Briefing name + dataset name
+      Recipients list (comma separated)
+      Next send time (human readable: "Next: Monday at 8:00 AM UTC")
+      [Send Now] [Edit] [Delete] action buttons
+  ─────────────────────────────────────────
+  SMTP SETUP NOTICE (shown when no SMTP config detected):
+    Amber info box: "Configure SMTP in your .env file to enable email delivery.
+    See docs for Gmail App Password setup. Until configured, you can use
+    'Send Now' to test PDF generation."
+
+STATE:
+  - schedules: BriefingSchedule[] (fetched from GET /api/briefing/schedules)
+  - form state for new briefing
+  - sending: boolean (for test send)
+  - error/success toasts
+
+RECIPIENT TAG INPUT:
+  - Text field where user types an email and presses Enter
+  - Email appears as a removable tag/pill (with × button)
+  - Validate email format before adding tag
+  - Show error inline if invalid email
+  - Max 10 tags enforced on the frontend
+
+
+--------------------------------------------------------------------------------
+FRONTEND — MODIFY: frontend/src/components/layout/Sidebar.tsx
+OR frontend/src/components/layout/Navbar.tsx
+--------------------------------------------------------------------------------
+
+Add one navigation item (do not change other items):
+
+  { to: "/briefings", icon: Mail, label: "Briefings" }
+
+Import Mail from lucide-react. Add /briefings route in App.tsx pointing to
+a BriefingsPage that renders <BriefingScheduler />.
+
+
+--------------------------------------------------------------------------------
+FRONTEND — NEW FILE: frontend/src/api/briefing.ts
+--------------------------------------------------------------------------------
+
+  import axios from "axios";
+  const BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+
+  export const createBriefingSchedule = (config: object) =>
+    axios.post(`${BASE}/briefing/schedule`, config).then(r => r.data);
+
+  export const sendBriefingNow = (jobId: string) =>
+    axios.post(`${BASE}/briefing/send-now/${jobId}`).then(r => r.data);
+
+  export const listBriefingSchedules = () =>
+    axios.get(`${BASE}/briefing/schedules`).then(r => r.data);
+
+  export const deleteBriefingSchedule = (jobId: string) =>
+    axios.delete(`${BASE}/briefing/schedule/${jobId}`).then(r => r.data);
+
+  export const updateBriefingSchedule = (jobId: string, config: object) =>
+    axios.put(`${BASE}/briefing/schedule/${jobId}`, config).then(r => r.data);
+
+
+--------------------------------------------------------------------------------
+EDGE CASES — FEATURE 5
+--------------------------------------------------------------------------------
+
+  - Invalid email address in recipients → Pydantic validator rejects, 422 response
+  - More than 10 recipients → rejected by validator
+  - SMTP credentials not configured → job runs, PDF generates, skip email, log warning
+  - SMTP password wrong → log error, do NOT crash scheduler, try again on next run
+  - PDF generation fails → log error, try to send email with text-only body
+  - Dataset deleted after briefing scheduled → job catches 404, logs error, skips that run
+  - APScheduler not available → HTTP 500 with install instruction
+  - Schedule same dataset twice → allow (separate job IDs)
+  - "Send Now" during test → runs full pipeline (can take 15-30s, show loading)
+  - Timezone invalid string → APScheduler raises, return 422 with timezone error
+  - Scheduler restarts (server restart) → jobs are in-memory, must be rescheduled (note in docs)
+  - Multiple runs of same job if server is slow → max_instances=1 prevents overlap
+  - Large PDF (many KPIs, many charts) → cap to 8 KPIs and 4 text-only insights in PDF
+  - Recipient unsubscribes (bounce/block) → SMTP exception caught, logged, job continues
+
+
+================================================================================
+COMPLETE INTEGRATION CHECKLIST
+================================================================================
+
+Before marking this prompt complete, verify every checkbox:
+
+FEATURE 1 — VOICE-TO-INSIGHT
+  [ ] backend/routers/voice_insight.py created and registered
+  [ ] GET /api/voice-insight/transcribe-and-render works
+  [ ] GET /api/voice-insight/speak-insight works
+  [ ] GlobalVoiceTrigger.tsx created (floating FAB, correct states)
+  [ ] VoiceInsightResult type added to types/index.ts
+  [ ] voiceInsight.ts API file created
+  [ ] dashboardStore.addVoiceTile() action added
+  [ ] DashboardPage renders <GlobalVoiceTrigger />
+  [ ] Silent audio rejected (RMS check)
+  [ ] 15s auto-stop recording implemented
+  [ ] Preview modal shows transcript + chart + summary
+  [ ] "Add to Dashboard" adds voice tile to canvas
+
+FEATURE 2 — WHAT-IF SCENARIO MODELING
+  [ ] backend/routers/scenario.py created and registered
+  [ ] POST /api/scenario/simulate works with debounce-friendly <800ms response
+  [ ] GET /api/scenario/parameters/{id} returns suggested sliders
+  [ ] WhatIfPanel.tsx created (slide-over, correct layout)
+  [ ] SliderControl.tsx created (color changes with value)
+  [ ] DeltaKPICard.tsx created (baseline → projected → delta)
+  [ ] ComparisonChart.tsx created (comparison_line and comparison_bar)
+  [ ] scenario.ts API file created
+  [ ] 300ms debounce on slider changes
+  [ ] "Reset All" resets all sliders
+  [ ] WhatIfPanel dismissable via ×, Escape, outside click
+  [ ] "What-If Simulator" button added to DashboardPage header
+
+FEATURE 3 — DATA MESH CROSS-CORRELATION
+  [ ] backend/routers/data_mesh.py created and registered
+  [ ] POST /api/data-mesh/suggest-joins returns scored suggestions
+  [ ] POST /api/data-mesh/analyze performs merge + correlation + LLM
+  [ ] DataMeshPanel.tsx created (3-step flow)
+  [ ] dataMesh.ts API file created
+  [ ] Same-dataset-for-A-and-B prevented in UI
+  [ ] Merge > 50K rows auto-sampled
+  [ ] Empty merge result handled gracefully
+  [ ] Cross scatter chart renders correctly
+
+FEATURE 4 — LIVE DATABASE AGENT
+  [ ] backend/routers/db_agent.py created and registered
+  [ ] POST /api/db-agent/connect/sqlite works
+  [ ] POST /api/db-agent/connect/postgres works (graceful if psycopg2 missing)
+  [ ] POST /api/db-agent/connect/mysql works (graceful if pymysql missing)
+  [ ] POST /api/db-agent/query generates and executes SQL
+  [ ] POST /api/db-agent/execute-reviewed validates safety before executing
+  [ ] _check_sql_safety blocks all non-SELECT operations
+  [ ] DatabaseConnector.tsx created with 3 tabs
+  [ ] Generated SQL always shown to user in code block
+  [ ] "Read-only mode" notice shown persistently
+  [ ] dbAgent.ts API file created
+  [ ] SQLite files cleaned up on disconnect
+
+FEATURE 5 — MORNING BRIEFING DISPATCHER
+  [ ] backend/services/scheduler.py created
+  [ ] backend/routers/briefing.py created and registered
+  [ ] POST /api/briefing/schedule creates cron job
+  [ ] POST /api/briefing/send-now triggers immediate run
+  [ ] GET /api/briefing/schedules lists jobs
+  [ ] DELETE /api/briefing/schedule/{id} cancels job
+  [ ] Email sends with PDF attachment via SMTP
+  [ ] PDF generated correctly with KPI table + insights
+  [ ] BriefingScheduler.tsx created (form + active list)
+  [ ] Email tag input validates format
+  [ ] "Briefings" nav item added to sidebar
+  [ ] .env.example updated with SMTP variables
+  [ ] APScheduler and pytz added to requirements.txt
+  [ ] SMTP not configured → graceful skip (no crash)
+
+================================================================================
+NOTES FOR KIRO
+================================================================================
+
+1. IMPORT RULES: All new backend files must import from EXISTING modules:
+     - LLM calls: from utils.llm import call_llm
+     - DB access: from database.db import get_dataset_from_db (or existing equivalent)
+     - KPI computation: from services.kpi_engine import compute_kpis
+     - Chart generation: from services.chart_generator import _build_*
+   Do NOT create new LLM clients or new database connections.
+
+2. REGISTRATION PATTERN: Every new router follows this pattern in main.py:
+     from routers.NEW_FILE import router as new_router
+     app.include_router(new_router, prefix="/api/NEW_PREFIX", tags=["Tag"])
+   One import + one include_router per feature. Nothing else changes in main.py.
+
+3. TYPESCRIPT TYPES: Add all new interfaces to frontend/src/types/index.ts.
+   Do not create separate types files per feature.
+
+4. CSS VARIABLES: Every color reference in new frontend components uses:
+     var(--color-background-primary)   var(--color-text-primary)
+     var(--color-background-secondary) var(--color-text-secondary)
+     var(--color-border-tertiary)      var(--color-text-success)
+     var(--color-background-info)      var(--color-text-danger)
+   NEVER hardcode hex values like #1a1a2e in React components.
+
+5. ZUSTAND STORES: New state is ADDED to existing stores using Zustand's
+   set() pattern. Do not create new stores.
+
+6. API CLIENT PATTERN: New API functions go in new feature-specific files
+   (voiceInsight.ts, scenario.ts, etc.) — do NOT modify the existing
+   frontend/src/api/client.ts unless adding a single helper function.
+
+7. NO BREAKING CHANGES: Features 1-5 add new routes, new components, and
+   minimal additions to existing files. The only existing files modified are:
+     - backend/main.py (2 lines added per feature: import + include_router)
+     - backend/requirements.txt (new packages only)
+     - backend/.env.example (new SMTP vars only)
+     - frontend/src/types/index.ts (new interfaces only)
+     - frontend/src/stores/dashboardStore.ts (addVoiceTile action only)
+     - frontend/src/pages/DashboardPage.tsx (2 additions: button + component render)
+     - frontend/src/components/layout/Sidebar.tsx (1 nav item only)
+     - frontend/src/App.tsx (1 new route only)
+
+================================================================================
+END OF KIRO PROMPT — TALKING BI 5 NEW POWER FEATURES
+Version: 3.0 | For: Kabir | Project: Talking BI at Rabbitt AI
+================================================================================
