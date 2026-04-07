@@ -46,6 +46,15 @@ backend/data/exports/
 backend/backend/data/
 data/
 
+# ML Models (LARGE FILES - DO NOT COMMIT)
+backend/models/
+models/
+*.pkl
+*.pth
+*.h5
+*.safetensors
+*.bin
+
 # Database
 *.db
 *.sqlite
