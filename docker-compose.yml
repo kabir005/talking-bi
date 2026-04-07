@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Redis for Celery broker
   redis:
@@ -30,6 +28,14 @@ services:
       - DATA_DIR=/app/data
       - GROQ_API_KEY=${GROQ_API_KEY:-}
       - CORS_ORIGINS=http://localhost,http://localhost:80,http://localhost:3000
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama2}
+      - LLM_PROVIDER=${LLM_PROVIDER:-auto}
     volumes:
       - backend_data:/app/data
       - backend_logs:/app/logs
@@ -50,11 +56,19 @@ services:
       dockerfile: Dockerfile.backend
     container_name: talking-bi-celery
     restart: unless-stopped
-    command: celery -A celery_app worker --loglevel=info --concurrency=2
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DATA_DIR=/app/data
       - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama2}
+      - LLM_PROVIDER=${LLM_PROVIDER:-auto}
     volumes:
       - backend_data:/app/data
       - backend_logs:/app/logs
@@ -76,10 +90,11 @@ services:
     depends_on:
       - backend
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/"]
+      test: ["CMD", "curl", "-f", "http://localhost/"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 10s
 
 volumes:
   redis_data:

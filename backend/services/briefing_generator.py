@@ -4,6 +4,7 @@ Generates briefing content from dataset analysis.
 """
 
 import logging
+import os
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
@@ -31,8 +32,26 @@ async def generate_briefing_content(dataset_id: str, config: dict) -> dict:
             if not dataset:
                 raise ValueError(f"Dataset {dataset_id} not found")
             
-            # Load data
-            df = pd.read_csv(dataset.source_path)
+            # Load data - handle both absolute and relative paths
+            import os
+            source_path = dataset.source_path
+            
+            # Normalize path separators (Windows \ to Linux /)
+            source_path = source_path.replace('\\', '/')
+            
+            # If path doesn't exist, try to construct it from DATA_DIR
+            if not os.path.exists(source_path):
+                data_dir = os.getenv("DATA_DIR", "./data")
+                # Extract just the filename from the path
+                filename = os.path.basename(source_path)
+                source_path = os.path.join(data_dir, filename)
+                
+                # If still not found, log error with details
+                if not os.path.exists(source_path):
+                    logger.error(f"Dataset file not found. Original: {dataset.source_path}, Tried: {source_path}")
+                    raise FileNotFoundError(f"Dataset file not found: {dataset.source_path}")
+            
+            df = pd.read_csv(source_path)
             
             # Generate analysis
             analysis = analyze_dataset(df, config)

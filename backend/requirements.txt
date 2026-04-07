@@ -52,3 +52,5 @@ pymysql>=1.1.0
 # ── New: Morning Briefing Dispatcher ───────────────────────────────────────
 APScheduler>=3.10.4
 pytz>=2024.1
+# ── System Monitoring ──────────────────────────────────────────────────────────
+psutil>=5.9.0
